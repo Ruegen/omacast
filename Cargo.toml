@@ -1,0 +1,36 @@
+[package]
+name = "omacast"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Ruegen"]
+description = "Minimalist AirPlay video TUI for keyboard-driven Linux"
+readme = "README.md"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+mdns-sd = "0.21"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+clap = { version = "4", features = ["derive", "env"] }
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+local-ip-address = "0.6"
+futures = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
+bytes = "1"
+sha2 = "0.10"
+hkdf = "0.12"
+hmac = "0.12"
+ed25519-dalek = "2"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+rand = "0.8"
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+num-bigint = "0.4"
+num-traits = "0.2"
+aes = "0.8"
+ctr = "0.9"

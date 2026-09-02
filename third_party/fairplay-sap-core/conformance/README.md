@@ -1,0 +1,185 @@
+# Conformance fixtures
+
+Language-independent test data. Nothing here is an implementation, so nothing
+here carries a licence beyond this repository's — these are the numbers your
+port has to reproduce, not code to copy.
+
+## `ring_indices.csv` — the unsigned-underflow trap
+
+**Check this first in any port. It is the one that fails silently.**
+
+The FairPlay SAP scramble reads its 210-byte work buffer through four index
+sequences, derived once per hash for `i` in `[0, 840)`:
+
+```
+x[i] = (i - 155) % 210
+y[i] = (i -  57) % 210
+z[i] = (i -  13) % 210
+w[i] = (i      ) % 210
+```
+
+`i` is a **32-bit unsigned** counter. For `i < 155` the first subtraction
+underflows and wraps through 2³² *before* the modulo runs, so `(i-155) % 210` is
+**not** `(i+55) % 210` as ordinary signed reasoning suggests. It is
+`(i + 101) % 210`, because 2³² mod 210 = 46 and 55 + 46 = 101.
+
+The damage is exactly the first 155 entries of `x`, 57 of `y`, and 13 of `z`;
+`w` never underflows. Concretely:
+
+| | correct | naive `(i+55) % 210` |
+|---|---|---|
+| `x[0]` | **101** | 55 |
+| `x[154]` | **45** | 209 |
+| `x[155]` | 0 | 0 — the sequences agree from here on |
+
+So a port that gets this wrong still produces a plausible-looking hash, still
+passes any test that only checks determinism or payload-sensitivity, and is
+wrong on every input. That is why this file exists.
+
+### What each language actually does
+
+All measured, none reasoned about. Every language named here was compiled and
+run; an earlier revision of this file marked C and Rust *not run* because the
+toolchain was unavailable, and both have since been checked.
+
+Asking each language for `(i - 155) % 210` at `i = 0`, where the answer must be
+**101**:
+
+| language | type | result | |
+|---|---|---|---|
+| C | `uint32_t` | **101** | correct, and the least fussy of the six |
+| Go | `uint32` | **101** | correct |
+| C# | `uint` | **101** | correct |
+| Kotlin | `Int` → `.toUInt()` | **101** | correct |
+| Rust | `u32`, plain `-` | **panic** in debug, 101 in release | see below |
+| Python | `int` | 55 | **wrong** |
+| Kotlin / Java | `Int` | −155 | **wrong, and negative** |
+| C# | `int` | −155 | **wrong, and negative** |
+
+Three different wrong answers plus a crash, which is the point. A port that gets
+55 produces a plausible hash on every input. A port that gets −155 indexes a
+210-byte buffer at −155 and either crashes or reads whatever precedes it, so at
+least that one is loud.
+
+**Rust is the odd one out.** Plain `i - 155` on a `u32` does not wrap: it
+**panics in debug builds** — `attempt to subtract with overflow` — and wraps to
+the correct 101 only in release. Both were run. That split is worse than a plain
+bug, because the code is *right* in the build you ship and *crashes* in the build
+you test. Write the intent explicitly:
+
+```rust
+let x = (i.wrapping_sub(155) % 210) as u8;
+```
+
+**Go and C# refuse to compile the constant form.** `uint32(0) - 155` is a
+compile-time error in Go (`constant -155 of type uint32 overflows uint32`) and
+`CS0220: The operation overflows at compile time in checked mode` in C#. The
+loop compiles fine because `i` is a variable — so the guard fires exactly where
+you were writing a test and not where the real bug lives. Both were hit while
+writing this file. C accepts the same constant silently and correctly, and even
+`-fsanitize=undefined` says nothing, because unsigned wraparound is defined
+behaviour in C rather than an accident.
+
+**C# has a third hazard.** A project built with
+`<CheckForOverflowUnderflow>true</CheckForOverflowUnderflow>`, or any expression
+inside `checked { }`, throws `OverflowException` at runtime. Confirmed here.
+
+For the languages that need the wrap forced:
+
+```python
+x = ((i - 155) % (1 << 32)) % 210          # Python
+```
+
+```kotlin
+val x = ((i - 155).toUInt() % 210u).toInt()   // Kotlin: via UInt
+```
+
+Note the two wrong answers arrive by different routes. Python's `%` returns a
+non-negative result for negative operands, giving 55; Kotlin and C# `Int`
+arithmetic just leaves −155. Neither resembles the other, so a bug found in one
+port tells you nothing about the shape of the bug in the next.
+
+### The file
+
+841 lines: a header, then one row per `i` in `[0, 840)`.
+
+```
+i,x,y,z,w
+0,101,199,33,0
+1,102,200,34,1
+...
+```
+
+### Digests
+
+If you would rather not parse the file, build the four tables and compare
+SHA-256 over the 840 raw bytes of each:
+
+| table | SHA-256 |
+|---|---|
+| `x` | `408941a6f3d6aef71c0c85e73d2ff3293ad04a5791466a1188d1b1d1e50d3b7a` |
+| `y` | `4ed70521d7e11ac671d3033ecb148d6fdb828b30e89fa2d634e90c31e17de877` |
+| `z` | `df5d95d147ce57d0784c369765781ae97c644550afe6665be288a24cdc34b4ae` |
+| `w` | `9bab2dd29089584c30562cb3dcd1d48676e86a239524742da13bfb83d2ecc752` |
+
+Reference implementation: `../fpsapcore/ring.go`.
+
+## `sap_hash.csv` — one 64-byte block through the SAP hash
+
+`block(64 bytes hex),sapHash(16 bytes hex)`, 40 rows. Generated by
+`../fpsapcore`'s `fairplaySAPHash`. Two of the rows are all-zero and
+all-`0xff`; the rest are pseudorandom from a fixed seed.
+
+This is the right place to start a port, because the SAP hash is where almost
+all of the difficulty lives — an 840-step ring loop over a 210-byte buffer, then
+a ~110-line straight-line byte circuit whose statement order is load-bearing.
+If these 40 pass, the hard part is done.
+
+**Row 0 is all zeros, and it passes even with a completely wrong index table.**
+A ring loop over an all-zero buffer stays all-zero whichever cells it reads. It
+is in the corpus deliberately, as a demonstration that a smoke test is not a
+test: verified here, the naive index derivation fails 39 of 40 vectors and
+passes exactly that one.
+
+## `bridge_x9head.csv` — the whole bridge
+
+`localSAP(128 hex),gp(128 hex),x9head(20 hex)`, 30 rows. `gp` is Phase 1's
+128-byte output buffer; the 20 bytes out are the only payload-dependent input
+Phase 2 consumes. Row 0 uses the frozen local SAP the Go golden vectors pin, so
+it cross-checks against those; the rest use fresh random ones, as a real sender
+generates per session.
+
+Passing this means your port is a complete Phase-1 bridge.
+
+## Ports that pass
+
+**Every language in `../ports/` now has one.** All six pass 40/40 SAP-hash and
+30/30 bridge vectors:
+
+| language | file | also checked |
+|---|---|---|
+| Go | `../fpsapcore` | the reference these files were generated from |
+| C | `../ports/c/fairplay_sapcore.c` | clean under `-Wpedantic -Wconversion`, and under UBSan + ASan |
+| Rust | `../ports/rust/fairplay_sapcore.rs` | passes in **debug**, where overflow checks are on |
+| C# | `../ports/csharp/FairPlaySapCore.cs` | passes with **`CheckForOverflowUnderflow`** enabled |
+| Kotlin | `../ports/kotlin/FairPlaySapCore.kt` | all arithmetic in `Int`; `ByteArray` only at the API boundary |
+| Python | `../ports/python/fairplay_sapcore.py` | asserts the corpus *rejects* three specific porting mistakes |
+
+Two of those "also checked" columns are the same idea in different clothes, and
+both are worth copying. Rust in debug and C# with `CheckForOverflowUnderflow`
+both turn the algorithm's deliberate unsigned wraps into hard failures unless
+every one of them is spelled out — `wrapping_*` in Rust, `unchecked` in C#. A
+port that only ever runs in release or unchecked mode has not been tested where
+it is weakest.
+
+## A warning about how you test this
+
+This repository's recurring failure is a validator that shares an implementation
+with the thing it validates — it proves nothing, and we have shipped that
+mistake more than once. Do not generate your expected indices with the same
+expression you are testing. Compare against this file, or against the digests,
+both of which came from a separate program.
+
+The same applies one level up: a test that only checks a hash is deterministic,
+or that it changes when the payload changes, passes just as happily on a wrong
+implementation. Sensitivity is not discrimination.

@@ -1,0 +1,14 @@
+# Release build output
+/dist/
+
+# macOS
+.DS_Store
+
+# Editor / local
+*.swp
+/nimbalyst-local/
+
+# Compiled artifacts from ad-hoc port builds
+*.o
+*.class
+*.jar

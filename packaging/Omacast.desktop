@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Name=Omacast
+Comment=AirPlay video to the TV
+Exec=alacritty --class omacast-app -e %h/.local/bin/omacast
+Terminal=false
+Type=Application
+Icon=omacast
+StartupNotify=true
+StartupWMClass=omacast-app
+Categories=AudioVideo;Video;
