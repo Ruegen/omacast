@@ -135,10 +135,7 @@ fn try_next_event(buf: &mut Vec<u8>) -> Result<Option<EventMsg>, String> {
         match bplist::from_binary(buf) {
             Ok(val) => {
                 let keys = plist_key_names(&val);
-                crate::airplay::debug_log(&format!(
-                    "event bplist keys={}",
-                    keys.join(",")
-                ));
+                crate::airplay::debug_log(&format!("event bplist keys={}", keys.join(",")));
                 buf.clear();
                 return Ok(Some(EventMsg::Plist));
             }
@@ -220,14 +217,7 @@ async fn handle_reverse_http(
         if let Some(hls) = hls {
             if let Some((bytes, mime)) = load_hls_asset(hls, &req.path) {
                 let body = if method == "HEAD" { Vec::new() } else { bytes };
-                let _ = write_http(
-                    stream,
-                    crypto,
-                    200,
-                    mime,
-                    &body,
-                )
-                .await;
+                let _ = write_http(stream, crypto, 200, mime, &body).await;
                 return;
             }
         }
@@ -283,7 +273,10 @@ pub async fn write_request(
         .write_all(&wire)
         .await
         .map_err(|e| format!("event write: {e}"))?;
-    stream.flush().await.map_err(|e| format!("event flush: {e}"))
+    stream
+        .flush()
+        .await
+        .map_err(|e| format!("event flush: {e}"))
 }
 
 async fn write_http(
@@ -313,7 +306,10 @@ async fn write_http(
         .write_all(&wire)
         .await
         .map_err(|e| format!("event write: {e}"))?;
-    stream.flush().await.map_err(|e| format!("event flush: {e}"))
+    stream
+        .flush()
+        .await
+        .map_err(|e| format!("event flush: {e}"))
 }
 
 pub fn parse_fcup_event(body: &[u8], content_type: &str) -> Option<FcupNeed> {

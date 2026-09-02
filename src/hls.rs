@@ -104,7 +104,9 @@ fn playlist_name(dir: &Path) -> String {
 }
 
 fn file_nonempty(path: &Path) -> bool {
-    std::fs::metadata(path).map(|m| m.is_file() && m.len() > 0).unwrap_or(false)
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
 }
 
 /// Simple HLS asset name: no slash, no `..`.
@@ -134,26 +136,21 @@ pub fn hls_content_type(name: &str) -> Option<&'static str> {
 }
 
 pub fn is_hls_asset(path: &str) -> bool {
-    hls_safe_name(path)
-        .and_then(hls_content_type)
-        .is_some()
+    hls_safe_name(path).and_then(hls_content_type).is_some()
 }
 
-async fn spawn_and_wait_playlist(input: &Path, dir: &Path, transcode: bool) -> Result<Child, String> {
+async fn spawn_and_wait_playlist(
+    input: &Path,
+    dir: &Path,
+    transcode: bool,
+) -> Result<Child, String> {
     let mut cmd = Command::new(FFMPEG);
     cmd.kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .current_dir(dir)
-        .args([
-            "-nostdin",
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-        ])
+        .args(["-nostdin", "-y", "-hide_banner", "-loglevel", "error", "-i"])
         .arg(input);
     if transcode {
         cmd.args([
@@ -256,7 +253,10 @@ mod tests {
             hls_content_type("master.m3u8"),
             Some("application/vnd.apple.mpegurl")
         );
-        assert_eq!(hls_content_type("OUT.M3U8"), Some("application/vnd.apple.mpegurl"));
+        assert_eq!(
+            hls_content_type("OUT.M3U8"),
+            Some("application/vnd.apple.mpegurl")
+        );
         assert_eq!(hls_content_type("out0.ts"), Some("video/mp2t"));
         assert_eq!(hls_content_type("clip.mkv"), None);
         assert!(is_hls_asset("/master.m3u8"));

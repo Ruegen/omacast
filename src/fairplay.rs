@@ -9,12 +9,7 @@ use rand::RngCore;
 
 extern "C" {
     fn fpsap_m1(out: *mut c_uchar, cap: c_int) -> c_int;
-    fn fpsap_exchange_m3(
-        m2: *const c_uchar,
-        m2len: c_int,
-        out: *mut c_uchar,
-        cap: c_int,
-    ) -> c_int;
+    fn fpsap_exchange_m3(m2: *const c_uchar, m2len: c_int, out: *mut c_uchar, cap: c_int) -> c_int;
 }
 
 pub const M1_LEN: usize = 16;

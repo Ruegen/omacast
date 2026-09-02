@@ -96,6 +96,16 @@ const FEAT_HLS: u32 = 4;
 const FEAT_SCREEN: u32 = 7;
 const FEAT_AUDIO: u32 = 9;
 
+/// Hisense resets AirPlay volume to max after RECORD. 15/100, never 1.0.
+const SCREEN_VOLUME: f64 = 0.15;
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const KEEP_ALIVE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// RTSP SET_PARAMETER / HTTP volume body. Always 0.15, never 1.0.
+pub(crate) fn volume_parameter_body(level: f64) -> String {
+    format!("volume: {level:.6}")
+}
+
 /// Parse mDNS `features` (`0xLOW,0xHIGH` or a single hex) as `(high << 32) | low`.
 fn parse_features(s: &str) -> Option<u64> {
     let s = s.trim();
@@ -205,8 +215,7 @@ const INFO_SKIP: &[&str] = &[
 /// FairPlay SAP m1 (FPLY v3, seq 1, capability mask 0x03). We cannot answer m3
 /// without the white-box AES tables.
 pub const FP_SETUP_M1: [u8; 16] = [
-    0x46, 0x50, 0x4c, 0x59, 0x03, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04, 0x02,
-    0x00, 0x03, 0xbb,
+    0x46, 0x50, 0x4c, 0x59, 0x03, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x04, 0x02, 0x00, 0x03, 0xbb,
 ];
 
 /// Mode byte from a FairPlay m2 record, if the body is a framed FPLY reply.
@@ -391,6 +400,8 @@ pub struct AirPlayClient {
     hap_ikm: Option<[u8; 32]>,
     /// Last type-110 SETUP `streamConnectionID` (decimal salt for ChaCha HKDF).
     last_stream_connection_id: Option<u64>,
+    last_keep_alive: Option<Instant>,
+    last_keep_alive_log: Option<Instant>,
 }
 
 impl Drop for AirPlayClient {
@@ -456,6 +467,8 @@ impl AirPlayClient {
             listen_task: None,
             hap_ikm: None,
             last_stream_connection_id: None,
+            last_keep_alive: None,
+            last_keep_alive_log: None,
         })
     }
 
@@ -867,7 +880,10 @@ impl AirPlayClient {
             ("Content-Type", "application/octet-stream"),
             ("X-Apple-ET", "32"),
         ];
-        match self.request("POST", "/fp-setup", &extra, &FP_SETUP_M1).await {
+        match self
+            .request("POST", "/fp-setup", &extra, &FP_SETUP_M1)
+            .await
+        {
             Ok(resp) if resp.is_success() => {
                 Self::log_fp_setup("fp-setup HTTP", &resp);
                 return;
@@ -1203,13 +1219,7 @@ impl AirPlayClient {
         match Http1Client::connect(&host, port).await {
             Ok(mut http) => {
                 match http
-                    .request_timeout(
-                        "POST",
-                        "/reverse",
-                        &extra,
-                        b"",
-                        Duration::from_secs(5),
-                    )
+                    .request_timeout("POST", "/reverse", &extra, b"", Duration::from_secs(5))
                     .await
                 {
                     Ok(resp) => {
@@ -1249,7 +1259,10 @@ impl AirPlayClient {
         let mut http = Http1Client::connect(&self.host, self.port).await?;
         let mut session = PairVerifySession::new(creds);
         let m1 = session.m1();
-        let hkp = [("X-Apple-HKP", "3"), ("Content-Type", "application/octet-stream")];
+        let hkp = [
+            ("X-Apple-HKP", "3"),
+            ("Content-Type", "application/octet-stream"),
+        ];
         let resp = http
             .request_timeout("POST", "/pair-verify", &hkp, &m1, Duration::from_secs(5))
             .await?;
@@ -1312,13 +1325,21 @@ impl AirPlayClient {
         }
     }
 
-    async fn post_command_shape(&mut self, label: &str, body: &[u8]) -> Result<HttpResponse, String> {
+    async fn post_command_shape(
+        &mut self,
+        label: &str,
+        body: &[u8],
+    ) -> Result<HttpResponse, String> {
         let resp = self.post_bplist("/command", body).await?;
         debug_response(label, &resp);
         Ok(resp)
     }
 
-    async fn post_action_shape(&mut self, label: &str, body: &[u8]) -> Result<HttpResponse, String> {
+    async fn post_action_shape(
+        &mut self,
+        label: &str,
+        body: &[u8],
+    ) -> Result<HttpResponse, String> {
         let resp = self.post_bplist("/action", body).await?;
         debug_response(label, &resp);
         Ok(resp)
@@ -1600,6 +1621,39 @@ impl AirPlayClient {
         }
     }
 
+    /// POST `/feedback` while ScreenStream is active. Rate-limited to ~15s.
+    /// Logs the first send and about once a minute thereafter (not every TUI tick).
+    pub async fn keep_alive(&mut self) {
+        if !self.screen_stream_active() {
+            return;
+        }
+        let now = Instant::now();
+        if let Some(last) = self.last_keep_alive {
+            if now.duration_since(last) < KEEP_ALIVE_INTERVAL {
+                return;
+            }
+        }
+        self.last_keep_alive = Some(now);
+        let log_this = match self.last_keep_alive_log {
+            None => true,
+            Some(t) => now.duration_since(t) >= KEEP_ALIVE_LOG_INTERVAL,
+        };
+        match self.request("POST", "/feedback", &[], b"").await {
+            Ok(fb) => {
+                if log_this {
+                    debug_response("POST /feedback", &fb);
+                    self.last_keep_alive_log = Some(now);
+                }
+            }
+            Err(err) => {
+                if log_this {
+                    debug_status_msg("POST /feedback", &err);
+                    self.last_keep_alive_log = Some(now);
+                }
+            }
+        }
+    }
+
     /// Wait until first frames/bytes (or ffmpeg already ended). Leaves the stream running.
     pub async fn wait_screen_stream_rolling(&mut self, timeout: Duration) {
         if let Some(s) = self.screen.as_mut() {
@@ -1610,9 +1664,14 @@ impl AirPlayClient {
     }
 
     /// Wait until the stream task finishes (ffmpeg EOF). No timeout cap.
+    /// POST /feedback ~every 15s on the control socket (does not block data TCP).
     pub async fn wait_screen_stream_eof(&mut self) {
-        if let Some(s) = self.screen.as_mut() {
-            s.wait_until(screen::ScreenWaitGoal::UntilEof, None).await;
+        loop {
+            if !self.screen_stream_active() {
+                break;
+            }
+            self.keep_alive().await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
         self.log_screen_stats();
     }
@@ -1637,10 +1696,7 @@ impl AirPlayClient {
         }
     }
 
-    async fn setup_record_session(
-        &mut self,
-        is_screen: bool,
-    ) -> Result<HttpResponse, PlayError> {
+    async fn setup_record_session(&mut self, is_screen: bool) -> Result<HttpResponse, PlayError> {
         let timing_port = self.ensure_timing_port().await.map_err(PlayError::Other)?;
         let setup = self
             .setup_rtsp(timing_port, is_screen)
@@ -1672,7 +1728,9 @@ impl AirPlayClient {
             if left.is_zero() {
                 break;
             }
-            let _ = self.wait_hls_or_fcup(left.min(Duration::from_millis(250))).await;
+            let _ = self
+                .wait_hls_or_fcup(left.min(Duration::from_millis(250)))
+                .await;
         }
         self.media_get_count() > 0 || self.fcup_count() > 0 || self.incoming_count() > 0
     }
@@ -1910,9 +1968,7 @@ impl AirPlayClient {
         }
     }
 
-    async fn setup_session_screen_plaintext(
-        &mut self,
-    ) -> Result<Option<HttpResponse>, PlayError> {
+    async fn setup_session_screen_plaintext(&mut self) -> Result<Option<HttpResponse>, PlayError> {
         let timing_port = self.ensure_timing_port().await.map_err(PlayError::Other)?;
         let session_uuid = Uuid::new_v4().to_string().to_uppercase();
         let body = crate::bplist::encode_setup_fairplay(
@@ -1967,12 +2023,7 @@ impl AirPlayClient {
         control_port: Option<u16>,
     ) -> Result<bool, PlayError> {
         match self
-            .setup_type_110_once_fp(
-                ekey,
-                eiv,
-                timing_port,
-                control_port,
-            )
+            .setup_type_110_once_fp(ekey, eiv, timing_port, control_port)
             .await
         {
             Ok(ScreenStreamSetup::Port(port)) => {
@@ -1983,36 +2034,45 @@ impl AirPlayClient {
                 )
                 .await
                 {
-                    Ok(Ok(record)) => debug_status("RECORD", record.status),
+                    Ok(Ok(record)) => {
+                        debug_status("RECORD", record.status);
+                        if record.is_success() {
+                            self.set_screen_volume_after_record().await;
+                        }
+                    }
                     Ok(Err(err)) => debug_status_msg("RECORD", &err),
                     Err(_) => debug_log("RECORD timed out"),
                 }
                 let crypto = match vcl_crypto {
                     VclCryptoKind::None => None,
-                    VclCryptoKind::HapChaCha => match (self.hap_ikm, self.last_stream_connection_id)
-                    {
-                        (Some(ikm), Some(id)) => {
-                            let key = crate::hap::data_stream_output_key(&ikm, id);
-                            Some(PayloadCrypto::chacha(&key))
+                    VclCryptoKind::HapChaCha => {
+                        match (self.hap_ikm, self.last_stream_connection_id) {
+                            (Some(ikm), Some(id)) => {
+                                let key = crate::hap::data_stream_output_key(&ikm, id);
+                                Some(PayloadCrypto::chacha(&key))
+                            }
+                            (None, _) => {
+                                debug_log("no pair-verify IKM, cannot ChaCha");
+                                return Ok(false);
+                            }
+                            (_, None) => {
+                                debug_log("no streamConnectionID, cannot ChaCha");
+                                return Ok(false);
+                            }
                         }
-                        (None, _) => {
-                            debug_log("no pair-verify IKM, cannot ChaCha");
-                            return Ok(false);
-                        }
-                        (_, None) => {
-                            debug_log("no streamConnectionID, cannot ChaCha");
-                            return Ok(false);
-                        }
-                    },
+                    }
                 };
                 self.start_h264_if_port(port, local_file, crypto).await;
                 self.feedback_and_get_parameter().await;
                 // First frames only — leave ScreenStream running. Do not wait for EOF here.
-                self.wait_screen_stream_rolling(Duration::from_secs(8)).await;
+                self.wait_screen_stream_rolling(Duration::from_secs(8))
+                    .await;
                 let n = self.screen_stream_frames();
                 let b = self.screen_stream_bytes();
                 let rolling = n > 0 || b > 0 || self.screen_stream_active();
-                debug_log(&format!("screen dataPort={port} frames={n} bytes={b} rolling={rolling}"));
+                debug_log(&format!(
+                    "screen dataPort={port} frames={n} bytes={b} rolling={rolling}"
+                ));
                 Ok(rolling)
             }
             Ok(ScreenStreamSetup::OkNoPort) => {
@@ -2118,7 +2178,6 @@ impl AirPlayClient {
         self.finish_type_110(local_file, None).await
     }
 
-
     async fn setup_session_screen_hap(
         &mut self,
         timing_port: u16,
@@ -2159,6 +2218,56 @@ impl AirPlayClient {
         }
     }
 
+    /// SET_PARAMETER volume 0.15 after RECORD. Hisense resets AirPlay volume to max.
+    /// Never send 1.0 / 100. On 400, try POST /volume then /volume?value=.
+    async fn set_screen_volume_after_record(&mut self) {
+        let body = volume_parameter_body(SCREEN_VOLUME);
+        debug_assert!(
+            (SCREEN_VOLUME - 1.0).abs() > 0.5,
+            "never send AirPlay volume 1.0"
+        );
+        let extra = [("Content-Type", "text/parameters")];
+        match self
+            .request_rtsp("SET_PARAMETER", &extra, body.as_bytes())
+            .await
+        {
+            Ok(resp) => {
+                debug_log(&format!("volume 0.15 (15/100) {}", resp.status));
+                if resp.is_success() {
+                    return;
+                }
+                if resp.status == 400 {
+                    self.set_screen_volume_http_fallback().await;
+                }
+            }
+            Err(err) => {
+                debug_status_msg("volume 0.15 (15/100)", &err);
+                self.set_screen_volume_http_fallback().await;
+            }
+        }
+    }
+
+    async fn set_screen_volume_http_fallback(&mut self) {
+        let body = volume_parameter_body(SCREEN_VOLUME);
+        let extra = [("Content-Type", "text/parameters")];
+        match self
+            .request("POST", "/volume", &extra, body.as_bytes())
+            .await
+        {
+            Ok(resp) if resp.is_success() => {
+                debug_log(&format!("POST /volume 0.15 (15/100) {}", resp.status));
+                return;
+            }
+            Ok(resp) => debug_log(&format!("POST /volume 0.15 (15/100) {}", resp.status)),
+            Err(err) => debug_status_msg("POST /volume 0.15 (15/100)", &err),
+        }
+        let path = format!("/volume?value={SCREEN_VOLUME:.6}");
+        match self.request("POST", &path, &[], b"").await {
+            Ok(resp) => debug_log(&format!("POST {path} 0.15 (15/100) {}", resp.status)),
+            Err(err) => debug_status_msg(&format!("POST {path} 0.15 (15/100)"), &err),
+        }
+    }
+
     async fn feedback_and_get_parameter(&mut self) {
         let fb_ok = match self.request("POST", "/feedback", &[], b"").await {
             Ok(fb) => {
@@ -2179,6 +2288,9 @@ impl AirPlayClient {
             }
             Err(err) => debug_status_msg("GET_PARAMETER", &err),
         }
+        let now = Instant::now();
+        self.last_keep_alive = Some(now);
+        self.last_keep_alive_log = Some(now);
     }
 
     /// HAP-encrypted screen: skip FairPlay SAP (not advertised), skip audio,
@@ -2196,7 +2308,9 @@ impl AirPlayClient {
         debug_log(
             "firewall: bind TCP/UDP 60000-60010; allow from 192.168.178.25 proto tcp/udp to 60000:60010",
         );
-        debug_log("FairPlay SAP skipped (not advertised); type 110 VCL ChaCha from pair-verify IKM");
+        debug_log(
+            "FairPlay SAP skipped (not advertised); type 110 VCL ChaCha from pair-verify IKM",
+        );
         let (timing_port, control_port, data_port, event_port) =
             match self.bind_screen_ports().await {
                 Ok(p) => p,
@@ -2768,7 +2882,8 @@ mod tests {
         classify_play_http, clear_net_log, debug_log, debug_status, device_wants_hls, feature_bit,
         fp_m2_mode, info_log_line, info_summary, is_screen_mirroring_tv, net_log_lines,
         parse_features, parse_playback_info, status_message, timing_reply, tv_features_line,
-        PlayClassify, FEAT_AUDIO, FEAT_HLS, FEAT_SCREEN, FEAT_VIDEO, FP_SETUP_M1,
+        volume_parameter_body, PlayClassify, FEAT_AUDIO, FEAT_HLS, FEAT_SCREEN, FEAT_VIDEO,
+        FP_SETUP_M1, KEEP_ALIVE_INTERVAL, KEEP_ALIVE_LOG_INTERVAL, SCREEN_VOLUME,
     };
     use crate::bplist::PlistValue;
     use crate::discovery::AirPlayDevice;
@@ -3057,6 +3172,22 @@ mod tests {
         assert!(summary.contains("displays[0].uuid=disp-1"));
         assert!(!summary.contains("SECRETKEY"));
         assert!(!summary.to_ascii_lowercase().contains("pk="));
+    }
+
+    #[test]
+    fn screen_volume_body_is_fifteen_percent_not_max() {
+        let body = volume_parameter_body(SCREEN_VOLUME);
+        assert_eq!(body, "volume: 0.150000");
+        assert!(body.contains("0.15"), "{body}");
+        assert!(!body.contains("1.0"), "{body}");
+        assert!(!body.contains("1.000"), "{body}");
+        assert!((SCREEN_VOLUME - 0.15).abs() < 1e-9);
+        assert!((SCREEN_VOLUME - 1.0).abs() > 0.5);
+        assert_ne!(SCREEN_VOLUME, 1.0);
+        let max = volume_parameter_body(1.0);
+        assert_ne!(body, max, "screen volume must not be 1.0");
+        assert_eq!(KEEP_ALIVE_INTERVAL.as_secs(), 15);
+        assert_eq!(KEEP_ALIVE_LOG_INTERVAL.as_secs(), 60);
     }
 
     #[test]

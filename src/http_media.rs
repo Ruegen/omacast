@@ -151,9 +151,7 @@ impl MediaServer {
             gets: gets.clone(),
         };
         let app = if is_hls {
-            Router::new()
-                .fallback(serve_media)
-                .with_state(state)
+            Router::new().fallback(serve_media).with_state(state)
         } else {
             Router::new()
                 .route("/media", get(serve_media).head(serve_media))
@@ -319,7 +317,10 @@ async fn serve_media_body(
         };
         (state.path.join(name), content_type)
     } else {
-        (state.path.as_ref().clone(), files::content_type_for(state.path.as_ref()))
+        (
+            state.path.as_ref().clone(),
+            files::content_type_for(state.path.as_ref()),
+        )
     };
 
     serve_file(method, headers, &file_path, content_type).await

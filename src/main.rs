@@ -165,7 +165,7 @@ async fn run_play(path: PathBuf, host: String, media_port: u16) {
     }
 
     if client.screen_stream_active() {
-        // Full file: ffmpeg EOF, then a couple of seconds, then TEARDOWN. No 12s cap.
+        // Full file: ffmpeg EOF (POST /feedback ~15s while waiting), then TEARDOWN. No 12s cap.
         client.wait_screen_stream_eof().await;
         tokio::time::sleep(Duration::from_secs(2)).await;
         let _ = client.stop().await;

@@ -1132,10 +1132,16 @@ impl App {
                 }
             }
             self.last_tick = now;
-            let active = self
-                .airplay
-                .as_ref()
-                .is_some_and(|c| c.screen_stream_active());
+            let active = if let Some(client) = self.airplay.as_mut() {
+                if client.screen_stream_active() {
+                    client.keep_alive().await;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
             if !active {
                 self.screen_cast_finished().await;
             }
@@ -1358,7 +1364,12 @@ async fn job_play(
         }
     }
     // Handshake only. play() returns once a type-110 stream is rolling.
-    match tokio::time::timeout(Duration::from_secs(75), client.play(&location, 0.0, Some(file.path.as_path()))).await {
+    match tokio::time::timeout(
+        Duration::from_secs(75),
+        client.play(&location, 0.0, Some(file.path.as_path())),
+    )
+    .await
+    {
         Ok(Ok(())) => NetResult::PlayOk {
             client,
             server,

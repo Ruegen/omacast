@@ -483,11 +483,7 @@ pub fn event_channel_keys(shared: &[u8]) -> ([u8; 32], [u8; 32]) {
 /// Never log the resulting key bytes.
 pub fn data_stream_output_key(ikm: &[u8; 32], stream_connection_id: u64) -> [u8; 32] {
     let salt = format!("DataStream-Salt{stream_connection_id}");
-    hkdf_32(
-        salt.as_bytes(),
-        b"DataStream-Output-Encryption-Key",
-        ikm,
-    )
+    hkdf_32(salt.as_bytes(), b"DataStream-Output-Encryption-Key", ikm)
 }
 
 fn decode_or_error(body: &[u8]) -> Result<TlvMap, String> {

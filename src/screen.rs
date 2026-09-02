@@ -52,6 +52,36 @@ const FFMPEG_ENCODE: &[&str] = &[
     "-i",
 ];
 
+/// libx264 after `-i <file>`. Cap bitrate for long files; no audio (`-an`).
+const FFMPEG_X264: &[&str] = &[
+    "-an",
+    "-c:v",
+    "libx264",
+    "-tune",
+    "zerolatency",
+    "-profile:v",
+    "baseline",
+    "-pix_fmt",
+    "yuv420p",
+    "-g",
+    "30",
+    "-bf",
+    "0",
+    "-b:v",
+    "4M",
+    "-maxrate",
+    "6M",
+    "-bufsize",
+    "8M",
+    "-s",
+    "1920x1080",
+    "-x264-params",
+    "repeat-headers=1:bframes=0:aud=1",
+    "-f",
+    "h264",
+    "pipe:1",
+];
+
 pub struct ScreenStream {
     child: Option<Child>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -108,7 +138,6 @@ impl ScreenStream {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
-
 }
 
 /// `play()` waits until first frames (Rolling). CLI `--play` waits for ffmpeg EOF.
@@ -172,11 +201,7 @@ impl PayloadCrypto {
 
     /// Encrypt one VCL frame. `header` is the 128-byte packet header already
     /// filled (including payloadSize). ChaCha uses it as AAD. AES-CTR ignores it.
-    fn encrypt_vcl(
-        &mut self,
-        header: &[u8; HEADER_LEN],
-        plaintext: &[u8],
-    ) -> Result<Vec<u8>, ()> {
+    fn encrypt_vcl(&mut self, header: &[u8; HEADER_LEN], plaintext: &[u8]) -> Result<Vec<u8>, ()> {
         match &mut self.inner {
             PayloadCryptoInner::AesCtr(ctr) => {
                 let mut data = plaintext.to_vec();
@@ -227,29 +252,8 @@ pub async fn start_screen_stream(
     // Re-encode (do not bitstream-copy High-profile MKV annex-B).
     cmd.args(FFMPEG_ENCODE);
     cmd.arg(&file_s);
-    cmd.args([
-        "-an",
-        "-c:v",
-        "libx264",
-        "-tune",
-        "zerolatency",
-        "-profile:v",
-        "baseline",
-        "-pix_fmt",
-        "yuv420p",
-        "-g",
-        "30",
-        "-bf",
-        "0",
-        "-s",
-        "1920x1080",
-        "-x264-params",
-        "repeat-headers=1:bframes=0:aud=1",
-        "-f",
-        "h264",
-        "pipe:1",
-    ]);
-    log("ffmpeg: libx264 -tune zerolatency -profile:v baseline -pix_fmt yuv420p -g 30 -bf 0 -re 1920x1080");
+    cmd.args(FFMPEG_X264);
+    log("ffmpeg: libx264 -tune zerolatency -profile:v baseline -pix_fmt yuv420p -g 30 -bf 0 -b:v 4M -maxrate 6M -bufsize 8M -re 1920x1080");
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(err) => {
@@ -498,7 +502,12 @@ impl FrameSender {
                     ));
                     self.logged_codec = true;
                 }
-                if !self.write_all(&config_header(avcc.len(), ts, self.width, self.height), &avcc).await
+                if !self
+                    .write_all(
+                        &config_header(avcc.len(), ts, self.width, self.height),
+                        &avcc,
+                    )
+                    .await
                 {
                     return false;
                 }
@@ -556,9 +565,11 @@ impl FrameSender {
 
     async fn write_all(&mut self, header: &[u8], payload: &[u8]) -> bool {
         if self.stream.write_all(header).await.is_err() {
+            (self.log)("dataPort write failed");
             return false;
         }
         if self.stream.write_all(payload).await.is_err() {
+            (self.log)("dataPort write failed");
             return false;
         }
         self.bytes
@@ -590,7 +601,12 @@ fn put_dimensions(header: &mut [u8; HEADER_LEN], width: f32, height: f32) {
     }
 }
 
-pub fn config_header(payload_len: usize, timestamp: u64, width: f32, height: f32) -> [u8; HEADER_LEN] {
+pub fn config_header(
+    payload_len: usize,
+    timestamp: u64,
+    width: f32,
+    height: f32,
+) -> [u8; HEADER_LEN] {
     let mut header = [0u8; HEADER_LEN];
     header[..4].copy_from_slice(&(payload_len as u32).to_le_bytes());
     header[4] = OPCODE_CONFIG;
@@ -678,7 +694,11 @@ fn start_code_len(nal: &[u8]) -> Option<usize> {
 pub fn find_start_code(buf: &[u8], from: usize) -> Option<(usize, usize)> {
     let mut i = from;
     while i + 3 <= buf.len() {
-        if i + 4 <= buf.len() && buf[i] == 0 && buf[i + 1] == 0 && buf[i + 2] == 0 && buf[i + 3] == 1
+        if i + 4 <= buf.len()
+            && buf[i] == 0
+            && buf[i + 1] == 0
+            && buf[i + 2] == 0
+            && buf[i + 3] == 1
         {
             return Some((i, 4));
         }
@@ -755,7 +775,10 @@ mod tests {
         assert_eq!(nal_type(&sps), Some(7));
         let pps = p.next_nal().unwrap();
         assert_eq!(nal_type(&pps), Some(8));
-        assert!(p.next_nal().is_none(), "IDR incomplete until next start or flush");
+        assert!(
+            p.next_nal().is_none(),
+            "IDR incomplete until next start or flush"
+        );
         let idr = p.flush().unwrap();
         assert_eq!(nal_type(&idr), Some(5));
         assert!(sps.starts_with(&[0, 0, 0, 1]));
@@ -786,7 +809,10 @@ mod tests {
         let k = video_header(9, 7, true);
         assert_eq!([k[4], k[5], k[6], k[7]], [0x00, 0x10, 0x00, 0x00]);
         assert_eq!(&k[8..16], &7u64.to_le_bytes());
-        assert!(k[16..64].iter().all(|&b| b == 0), "VCL packets have no image-size floats");
+        assert!(
+            k[16..64].iter().all(|&b| b == 0),
+            "VCL packets have no image-size floats"
+        );
         assert!(k[16..].iter().all(|&b| b == 0));
         let p = video_header(9, 7, false);
         assert_eq!([p[4], p[5], p[6], p[7]], [0x00, 0x00, 0x00, 0x00]);
@@ -835,7 +861,10 @@ mod tests {
     fn ntp_from_elapsed_is_boot_relative() {
         let t0 = ntp_from_elapsed(Duration::ZERO);
         let secs0 = t0 >> 32;
-        assert_eq!(secs0, 0, "100ms bias is under 1s; high 32 bits stay small, not unix NTP");
+        assert_eq!(
+            secs0, 0,
+            "100ms bias is under 1s; high 32 bits stay small, not unix NTP"
+        );
         assert!(secs0 < 100, "must not be unix-epoch NTP (~0xE9xxxxxx)");
         let frac0 = t0 & 0xffff_ffff;
         let expected_frac = (100_000_000u64 << 32) / 1_000_000_000;
@@ -865,7 +894,10 @@ mod tests {
         assert!(screen_wait_done(Rolling, 1, 0, false));
         assert!(screen_wait_done(Rolling, 0, 80, false));
         assert!(screen_wait_done(Rolling, 0, 0, true));
-        assert!(!screen_wait_done(UntilEof, 12, 4096, false), "frames must not end an UntilEof wait");
+        assert!(
+            !screen_wait_done(UntilEof, 12, 4096, false),
+            "frames must not end an UntilEof wait"
+        );
         assert!(screen_wait_done(UntilEof, 12, 4096, true));
         assert!(screen_wait_done(UntilEof, 0, 0, true));
     }
@@ -920,6 +952,22 @@ mod tests {
                 },
             )
             .is_err());
+    }
+
+    #[test]
+    fn ffmpeg_x264_caps_bitrate_silent_baseline() {
+        let joined = FFMPEG_X264.join(" ");
+        assert!(joined.contains("-b:v 4M"), "{joined}");
+        assert!(joined.contains("-maxrate 6M"), "{joined}");
+        assert!(joined.contains("-bufsize 8M"), "{joined}");
+        assert!(joined.contains("-an"), "{joined}");
+        assert!(joined.contains("libx264"), "{joined}");
+        assert!(joined.contains("zerolatency"), "{joined}");
+        assert!(joined.contains("baseline"), "{joined}");
+        assert!(joined.contains("1920x1080"), "{joined}");
+        assert!(!joined.contains("-c:a"), "no audio stream: {joined}");
+        let enc = FFMPEG_ENCODE.join(" ");
+        assert!(enc.contains("-re"), "{enc}");
     }
 
     #[test]

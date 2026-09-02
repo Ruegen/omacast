@@ -199,14 +199,8 @@ pub fn encode_fcup_response(url: &str, request_id: i64, data: &[u8], status: i64
         (
             "params".into(),
             PlistValue::Dict(vec![
-                (
-                    "FCUP_Response_URL".into(),
-                    PlistValue::String(url.into()),
-                ),
-                (
-                    "FCUP_Response_Data".into(),
-                    PlistValue::Data(data.to_vec()),
-                ),
+                ("FCUP_Response_URL".into(), PlistValue::String(url.into())),
+                ("FCUP_Response_Data".into(), PlistValue::Data(data.to_vec())),
                 (
                     "FCUP_Response_StatusCode".into(),
                     PlistValue::Integer(status),
@@ -353,10 +347,7 @@ fn encode_setup_body(
         ("statsCollectionEnabled".into(), PlistValue::Boolean(false)),
     ];
     if is_screen_mirroring {
-        pairs.push((
-            "isScreenMirroringSession".into(),
-            PlistValue::Boolean(true),
-        ));
+        pairs.push(("isScreenMirroringSession".into(), PlistValue::Boolean(true)));
     }
     if let Some(key) = ekey {
         pairs.push(("ekey".into(), PlistValue::Data(key.to_vec())));
@@ -419,19 +410,18 @@ pub fn encode_setup_type_120(content_location: &str, uuid: &str) -> Vec<u8> {
             ("uuid".into(), PlistValue::String(uuid.into())),
             (
                 "mediaType".into(),
-                PlistValue::String(if content_location.contains(".m3u8")
-                    || content_location.starts_with("mlhls://")
-                {
-                    "streaming".into()
-                } else {
-                    "file".into()
-                }),
+                PlistValue::String(
+                    if content_location.contains(".m3u8")
+                        || content_location.starts_with("mlhls://")
+                    {
+                        "streaming".into()
+                    } else {
+                        "file".into()
+                    },
+                ),
             ),
             ("streamType".into(), PlistValue::Integer(1)),
-            (
-                "Start-Position-Seconds".into(),
-                PlistValue::Real(0.0),
-            ),
+            ("Start-Position-Seconds".into(), PlistValue::Real(0.0)),
         ])]),
     )]))
 }
@@ -531,9 +521,7 @@ fn timestamp_info_array() -> PlistValue {
     PlistValue::Array(
         TIMESTAMP_INFO_NAMES
             .iter()
-            .map(|name| {
-                PlistValue::Dict(vec![("name".into(), PlistValue::String((*name).into()))])
-            })
+            .map(|name| PlistValue::Dict(vec![("name".into(), PlistValue::String((*name).into()))]))
             .collect(),
     )
 }
@@ -1249,10 +1237,7 @@ mod tests {
             dict_get(s120, "Content-Location"),
             Some(&PlistValue::String(url.into()))
         );
-        assert_eq!(
-            dict_get(s120, "url"),
-            Some(&PlistValue::String(url.into()))
-        );
+        assert_eq!(dict_get(s120, "url"), Some(&PlistValue::String(url.into())));
         assert_eq!(
             dict_get(s120, "uuid"),
             Some(&PlistValue::String("stream-120-uuid".into()))
@@ -1402,10 +1387,7 @@ mod tests {
         let PlistValue::Dict(item) = &items[0] else {
             panic!("item0");
         };
-        assert_eq!(
-            dict_get(item, "url"),
-            Some(&PlistValue::String(url.into()))
-        );
+        assert_eq!(dict_get(item, "url"), Some(&PlistValue::String(url.into())));
     }
 
     #[test]
@@ -1442,7 +1424,10 @@ mod tests {
             panic!("stream");
         };
         assert_eq!(dict_get(stream, "type"), Some(&PlistValue::Integer(120)));
-        assert_eq!(dict_get(stream, "dataPort"), Some(&PlistValue::Integer(7010)));
+        assert_eq!(
+            dict_get(stream, "dataPort"),
+            Some(&PlistValue::Integer(7010))
+        );
         assert_eq!(
             dict_get(stream, "controlPort"),
             Some(&PlistValue::Integer(7011))
@@ -1491,7 +1476,8 @@ mod tests {
     fn screen_ios_fp_has_ports_and_ekey_not_bytes_in_keys() {
         let ekey = [0xABu8; 16];
         let eiv = [0xCDu8; 16];
-        let bytes = encode_setup_screen_ios_fp(99, "screen-uuid", Some(&ekey), Some(&eiv), 60000, 60001);
+        let bytes =
+            encode_setup_screen_ios_fp(99, "screen-uuid", Some(&ekey), Some(&eiv), 60000, 60001);
         let root = from_binary(&bytes).unwrap();
         let PlistValue::Dict(pairs) = root else {
             panic!("not dict");
@@ -1502,8 +1488,14 @@ mod tests {
         let PlistValue::Dict(stream) = &items[0] else {
             panic!("stream");
         };
-        assert_eq!(dict_get(stream, "timingPort"), Some(&PlistValue::Integer(60000)));
-        assert_eq!(dict_get(stream, "controlPort"), Some(&PlistValue::Integer(60001)));
+        assert_eq!(
+            dict_get(stream, "timingPort"),
+            Some(&PlistValue::Integer(60000))
+        );
+        assert_eq!(
+            dict_get(stream, "controlPort"),
+            Some(&PlistValue::Integer(60001))
+        );
         assert_eq!(dict_get(stream, "et"), Some(&PlistValue::Integer(32)));
         match dict_get(stream, "ekey") {
             Some(PlistValue::Data(d)) => assert_eq!(d.len(), 16),
@@ -1533,7 +1525,8 @@ mod tests {
             Some(PlistValue::Data(d)) => assert_eq!(d.len(), 72),
             other => panic!("ekey missing: {other:?}"),
         }
-        let session = encode_setup_fairplay("AA:BB:CC:DD:EE:FF", "U", 9, Some(&ekey), Some(&[0u8; 16]));
+        let session =
+            encode_setup_fairplay("AA:BB:CC:DD:EE:FF", "U", 9, Some(&ekey), Some(&[0u8; 16]));
         let sroot = from_binary(&session).unwrap();
         let PlistValue::Dict(spairs) = sroot else {
             panic!("not dict");
