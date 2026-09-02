@@ -1584,10 +1584,6 @@ impl AirPlayClient {
         self.screen.as_ref().is_some_and(|s| s.is_active())
     }
 
-    pub fn is_screen_mirroring(&self) -> bool {
-        self.is_screen_mirroring
-    }
-
     pub fn screen_stream_frames(&self) -> u64 {
         self.screen.as_ref().map(|s| s.frame_count()).unwrap_or(0)
     }
@@ -1602,13 +1598,6 @@ impl AirPlayClient {
         if n > 0 || b > 0 {
             debug_log(&format!("screen stream frames={n} bytes={b}"));
         }
-    }
-
-    pub async fn wait_screen_stream(&mut self, timeout: Duration) {
-        if let Some(s) = self.screen.as_mut() {
-            s.wait_or_timeout(timeout).await;
-        }
-        self.log_screen_stats();
     }
 
     /// Wait until first frames/bytes (or ffmpeg already ended). Leaves the stream running.

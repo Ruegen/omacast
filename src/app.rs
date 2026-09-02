@@ -901,6 +901,7 @@ impl App {
     fn stay_on_files_not_playing(&mut self) {
         self.playing = false;
         self.play_ok = false;
+        self.screen_cast = false;
         self.teardown_server();
         self.pending_location = None;
         self.screen = Screen::Files;
@@ -909,6 +910,7 @@ impl App {
     fn pairing_gave_up(&mut self) {
         self.playing = false;
         self.play_ok = false;
+        self.screen_cast = false;
         self.session_paired = false;
         self.teardown_server();
         self.pending_location = None;
@@ -959,6 +961,7 @@ impl App {
             KeyCode::Esc => {
                 self.stop_and_files().await;
             }
+            _ if self.screen_cast => {}
             KeyCode::Char(' ') => self.toggle_pause().await,
             KeyCode::Left if shift => self.seek(-60.0).await,
             KeyCode::Right if shift => self.seek(60.0).await,
@@ -1059,10 +1062,24 @@ impl App {
         self.airplay = None;
         self.playing = false;
         self.play_ok = false;
+        self.screen_cast = false;
         self.pair_setup = None;
         self.pending_location = None;
         self.screen = Screen::Files;
         self.status = "Stopped".to_string();
+    }
+
+    async fn screen_cast_finished(&mut self) {
+        self.send_stop().await;
+        self.teardown_server();
+        self.airplay = None;
+        self.playing = false;
+        self.play_ok = false;
+        self.screen_cast = false;
+        self.pair_setup = None;
+        self.pending_location = None;
+        self.screen = Screen::Files;
+        self.status = "Done".to_string();
     }
 
     async fn stop_and_exit(&mut self) {
@@ -1106,6 +1123,25 @@ impl App {
         }
 
         let now = Instant::now();
+        if self.screen_cast {
+            if self.playing {
+                let dt = now.duration_since(self.last_tick).as_secs_f64();
+                self.position += dt;
+                if self.duration > 0.0 {
+                    self.position = self.position.min(self.duration);
+                }
+            }
+            self.last_tick = now;
+            let active = self
+                .airplay
+                .as_ref()
+                .is_some_and(|c| c.screen_stream_active());
+            if !active {
+                self.screen_cast_finished().await;
+            }
+            return;
+        }
+
         if self.playing && !self.playback_info_ok {
             let dt = now.duration_since(self.last_tick).as_secs_f64();
             self.position += dt;
@@ -1271,17 +1307,26 @@ async fn job_play(
             let _ = tokio::time::timeout(Duration::from_secs(2), c.stop()).await;
         }
     }
-    let hls = crate::airplay::device_wants_hls(&device);
-    let server = match MediaServer::start_for(file.path.clone(), media_port, hls).await {
-        Ok(s) => s,
-        Err(err) => {
-            return NetResult::PlayFail {
-                client,
-                err: format!("media server: {err}"),
-            };
+    let screen = crate::airplay::is_screen_mirroring_tv(&device);
+    let mut server = None;
+    let location = if screen {
+        format!("file://{}", file.path.to_string_lossy())
+    } else {
+        let hls = crate::airplay::device_wants_hls(&device);
+        match MediaServer::start_for(file.path.clone(), media_port, hls).await {
+            Ok(s) => {
+                let loc = s.content_location();
+                server = Some(s);
+                loc
+            }
+            Err(err) => {
+                return NetResult::PlayFail {
+                    client,
+                    err: format!("media server: {err}"),
+                };
+            }
         }
     };
-    let location = server.content_location();
     let mut client = match client {
         Some(c) => c,
         None => match AirPlayClient::connect(device, device_id).await {
@@ -1306,10 +1351,13 @@ async fn job_play(
             }
         }
     }
-    client.set_media_gets(server.request_count());
-    if let Some(dir) = server.hls_dir() {
-        client.set_hls(dir, server.origin());
+    if let Some(ref s) = server {
+        client.set_media_gets(s.request_count());
+        if let Some(dir) = s.hls_dir() {
+            client.set_hls(dir, s.origin());
+        }
     }
+    // Handshake only. play() returns once a type-110 stream is rolling.
     match tokio::time::timeout(Duration::from_secs(75), client.play(&location, 0.0, Some(file.path.as_path()))).await {
         Ok(Ok(())) => NetResult::PlayOk {
             client,
@@ -1328,7 +1376,7 @@ async fn job_play(
         },
         Err(_) => NetResult::PlayFail {
             client: Some(client),
-            err: "POST /play timed out".into(),
+            err: "play timed out".into(),
         },
     }
 }
@@ -1336,12 +1384,14 @@ async fn job_play(
 async fn job_retry_play(
     mut client: AirPlayClient,
     location: String,
-    server: MediaServer,
+    server: Option<MediaServer>,
     local_file: Option<PathBuf>,
 ) -> NetResult {
-    client.set_media_gets(server.request_count());
-    if let Some(dir) = server.hls_dir() {
-        client.set_hls(dir, server.origin());
+    if let Some(ref s) = server {
+        client.set_media_gets(s.request_count());
+        if let Some(dir) = s.hls_dir() {
+            client.set_hls(dir, s.origin());
+        }
     }
     match tokio::time::timeout(
         Duration::from_secs(75),
@@ -1360,7 +1410,7 @@ async fn job_retry_play(
         },
         Err(_) => NetResult::PlayFail {
             client: Some(client),
-            err: "POST /play timed out".into(),
+            err: "play timed out".into(),
         },
     }
 }
@@ -1381,6 +1431,10 @@ pub fn format_time(secs: f64) -> String {
 }
 
 pub fn help_text(screen: Screen) -> &'static str {
+    help_text_cast(screen, false)
+}
+
+pub fn help_text_cast(screen: Screen, screen_cast: bool) -> &'static str {
     match screen {
         Screen::Discovery => "↑↓ select  Enter TV (pair)  r refresh  q quit",
         Screen::Files => {
@@ -1388,6 +1442,7 @@ pub fn help_text(screen: Screen) -> &'static str {
         }
         Screen::AddFolder => "type path  Enter save  Esc cancel  ~ expands",
         Screen::Pin => "0–9 enter code  Enter confirm  Esc cancel",
+        Screen::Control if screen_cast => "Esc stop  q quit",
         Screen::Control => {
             "Space play/pause  ←→ 10s  Shift+←→ 1m  0–9 jump 10%  Home/End  Esc stop  q quit"
         }
@@ -1396,17 +1451,30 @@ pub fn help_text(screen: Screen) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{busy_dots, help_text, BusyKind, Screen};
+    use super::{busy_dots, help_text, help_text_cast, BusyKind, Screen};
 
     #[test]
     fn busy_dots_cycle_connecting_pairing_playback() {
         assert_eq!(BusyKind::Connecting.label(), "Connecting");
         assert_eq!(BusyKind::Pairing.label(), "Pairing");
         assert_eq!(BusyKind::StartingPlayback.label(), "Starting playback");
+        assert_eq!(BusyKind::SendingToTv.label(), "Sending to TV");
         assert_eq!(busy_dots(0), ".");
         assert_eq!(busy_dots(1), "..");
         assert_eq!(busy_dots(2), "...");
         assert_eq!(busy_dots(3), ".");
+    }
+
+    #[test]
+    fn screen_cast_help_drops_seek_pause() {
+        let h = help_text_cast(Screen::Control, true).to_ascii_lowercase();
+        assert!(h.contains("esc"), "{h}");
+        assert!(h.contains("quit"), "{h}");
+        assert!(!h.contains("space"), "{h}");
+        assert!(!h.contains("seek"), "{h}");
+        assert!(!h.contains("pause"), "{h}");
+        let http = help_text(Screen::Control).to_ascii_lowercase();
+        assert!(http.contains("space"), "{http}");
     }
 
     #[test]

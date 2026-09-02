@@ -4,9 +4,13 @@
   <img src="preview.png" alt="Omacast" />
 </p>
 
-Cast local video to an AirPlay TV from the keyboard.
+Send a local video file to an AirPlay TV. No local player, no desktop mirror — the file plays on the TV.
+
+Video only for now. Omacast does not change the TV volume (it never sets 100%).
 
 ## Install (Omarchy)
+
+Needs ffmpeg. Omarchy / Hyprland.
 
 ```
 cd ~/apps/omacast
@@ -20,7 +24,11 @@ cp packaging/Omacast.desktop ~/.local/share/applications/
 source = ~/apps/omacast/packaging/hyprland-omacast.conf
 ```
 
-Super+Space, Omacast. PIN when you pick the TV, then pick a file.
+Super+Space, Omacast. Pick the TV, PIN once, pick a file — it plays on the TV. Esc stops.
+
+Headless: `omacast --play FILE --host IP`
+
+No DoubleTake or omarchy-airplay dependency.
 
 ## Remove
 
@@ -36,13 +44,20 @@ Delete `~/apps/omacast` and `~/.config/omacast` for a full wipe. In Hyprland, re
 
 Saved list: `~/.config/omacast/config.json`. On Files: `a` add a folder, `d` remove one. `--media-dir` adds a folder for this run only.
 
-Apple TVs often want H.264 + AAC in MP4. `.mkv` / `.mov` are listed; the TV may refuse them.
-
 ## Pairing
 
-PIN is one-time. Enter on a TV pairs immediately if there are no saved keys (or pair-verify fails). After that, pick a file. Keys live in `~/.config/omacast/credentials.json` — not the PIN.
+PIN is one-time. Enter on a TV pairs immediately if there are no saved keys (or pair-verify fails). After that, pick a file. Pairing keys live in `~/.config/omacast/` (not in git) — `credentials.json`, not the PIN.
 
 You are asked again only if the TV forgets this client, or you delete that file. On the TV: **Settings → AirPlay → Allow Access = Anyone on the Same Network**.
+
+## Hisense / AirPlay 2 screen TVs
+
+The TV connects back to this machine. Allow inbound TCP and UDP **60000–60010** from the TV:
+
+```
+sudo ufw allow from <TV_IP> to any port 60000:60010 proto tcp
+sudo ufw allow from <TV_IP> to any port 60000:60010 proto udp
+```
 
 ## Keys
 
@@ -54,13 +69,11 @@ Every screen shows a keys panel.
 
 **PIN** `0–9 enter code  Enter confirm  Esc cancel`
 
-**Control** `Space play/pause  ←→ 10s  Shift+←→ 1m  0–9 jump 10%  Home/End  Esc stop  q quit`
+**Control** `Esc stop  q quit` — while sending to the TV. Receivers that take a URL still have Space play/pause, seek, and jump keys.
 
 ## Notes
 
-- Local files only. No DRM. No ffmpeg or mpv.
-- One TCP connection to the TV. Pairing happens when you pick the TV; play starts the file server.
-- AirPlay 2: SETUP / RECORD / POST `/play`. Older TVs fall back to POST `/play` only.
-- `omacast --help` for `--media-dir` and `--port`.
+- Local files only. No DRM. ffmpeg is required.
+- `omacast --help` for `--play`, `--host`, `--media-dir`, and `--port`.
 
 MIT, copyright Ruegen 2026.

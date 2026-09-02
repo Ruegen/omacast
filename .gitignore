@@ -1,4 +1,9 @@
 /target
+target/
+preview/
+*.log
+.env
+credentials.json
 **/*.rs.bk
 .idea/
 .vscode/

@@ -109,10 +109,6 @@ impl ScreenStream {
         }
     }
 
-    /// Wait until ffmpeg EOF or `timeout`. Does not stop the stream on timeout.
-    pub async fn wait_or_timeout(&mut self, timeout: Duration) {
-        self.wait_until(ScreenWaitGoal::UntilEof, Some(timeout)).await;
-    }
 }
 
 /// `play()` waits until first frames (Rolling). CLI `--play` waits for ffmpeg EOF.

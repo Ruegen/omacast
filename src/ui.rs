@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::{format_time, help_text, App, Screen};
+use crate::app::{format_time, help_text, help_text_cast, App, Screen};
 use crate::files;
 
 const ACCENT: Color = Color::Cyan;
@@ -16,6 +16,7 @@ const ERR: Color = Color::Red;
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let help_h = match app.screen {
+        Screen::Control if app.screen_cast => 5,
         Screen::Control => 11,
         Screen::Pin => 5,
         _ => 3,
@@ -296,7 +297,14 @@ fn draw_control(frame: &mut Frame, app: &App, area: Rect) {
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "—".into());
-    let state = if app.playing { "playing" } else { "paused" };
+    let state = if app.screen_cast {
+        format!("sending to the TV — on {device}")
+    } else if app.playing {
+        "playing".into()
+    } else {
+        "paused".into()
+    };
+    let title = if app.screen_cast { "On TV" } else { "control" };
 
     let info = Paragraph::new(vec![
         Line::from(vec![
@@ -312,7 +320,7 @@ fn draw_control(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(state),
         ]),
     ])
-    .block(title_block("control"));
+    .block(title_block(title));
     frame.render_widget(info, chunks[0]);
 
     let ratio = app.progress_ratio();
@@ -366,6 +374,21 @@ fn draw_keys(frame: &mut Frame, app: &App, area: Rect) {
         ));
 
     let lines = match app.screen {
+        Screen::Control if app.screen_cast => vec![
+            Line::from(Span::styled(
+                help_text_cast(Screen::Control, true),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                key_name("Esc"),
+                Span::raw(" stop, back to files    "),
+                key_name("q"),
+                Span::raw(" stop and quit"),
+            ]),
+        ],
         Screen::Control => vec![
             Line::from(Span::styled(
                 help_text(Screen::Control),
