@@ -87,7 +87,7 @@ pub async fn start_cast(
     file: &Path,
     media_port: u16,
     start: f64,
-) -> Result<(CastSession, f64), String> {
+) -> Result<(CastSession, f64, &'static str), String> {
     let (duration, source) = tokio::join!(probe_duration(file), decide_cast_source(file));
     let slug = uuid::Uuid::new_v4().simple().to_string();
     let server = match bind_on_open_port(file.to_path_buf(), media_port, ip, &slug, source, start)
@@ -145,6 +145,7 @@ pub async fn start_cast(
             tmp: None,
         },
         duration,
+        source.status_note(),
     ))
 }
 
@@ -152,7 +153,7 @@ pub async fn start_cast_desktop(
     ip: &str,
     port: u16,
     media_port: u16,
-) -> Result<(CastSession, f64), String> {
+) -> Result<(CastSession, f64, &'static str), String> {
     let slug = uuid::Uuid::new_v4().simple().to_string();
     let dummy = crate::capture::desktop_path();
     let server = bind_on_open_port(
@@ -200,6 +201,7 @@ pub async fn start_cast_desktop(
             tmp: None,
         },
         0.0,
+        "mirroring",
     ))
 }
 
@@ -374,6 +376,17 @@ enum CastSource {
     Desktop,
 }
 
+impl CastSource {
+    fn status_note(self) -> &'static str {
+        match self {
+            Self::File => "direct file",
+            Self::LiveCopyVideo => "live remux (audio)",
+            Self::LiveTranscode => "live transcode",
+            Self::Desktop => "mirroring",
+        }
+    }
+}
+
 async fn decide_cast_source(path: &Path) -> CastSource {
     let info = probe_streams(path).await;
     let ok_video = info.video == "h264";
@@ -544,5 +557,12 @@ mod tests {
         assert!(!audio_ok_for_cast("aac", 6));
         assert!(!audio_ok_for_cast("ac3", 2));
         assert!(audio_ok_for_cast("", 0));
+    }
+
+    #[test]
+    fn cast_notes_explain_slow_start() {
+        assert_eq!(CastSource::File.status_note(), "direct file");
+        assert_eq!(CastSource::LiveCopyVideo.status_note(), "live remux (audio)");
+        assert_eq!(CastSource::LiveTranscode.status_note(), "live transcode");
     }
 }

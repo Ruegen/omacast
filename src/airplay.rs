@@ -154,20 +154,26 @@ pub fn is_screen_mirroring_tv(device: &AirPlayDevice) -> bool {
         && matches!(feature_bit(bits, FEAT_VIDEO), Some(false))
 }
 
-/// Hisense-class: Screen=yes Video=no. Features may say Audio=yes; SETUP never worked.
+/// Guess from AirPlay bits: Screen=yes and Video=no. Any brand, not Hisense-only.
+/// The Audio bit is ignored — some TVs advertise it but never accept audio SETUP.
 pub fn device_has_no_audio(device: &AirPlayDevice) -> bool {
     !device.is_chromecast() && is_screen_mirroring_tv(device)
 }
 
-/// Feature detect, or a saved mark from a previous session.
-pub fn device_marked_no_audio(device: &AirPlayDevice, marks: &[String]) -> bool {
-    if device_has_no_audio(device) {
+/// User `has_audio` wins, then user `no_audio`, then the feature guess.
+pub fn device_marked_no_audio(
+    device: &AirPlayDevice,
+    no_audio: &[String],
+    has_audio: &[String],
+) -> bool {
+    let keys = device.cred_lookup_keys();
+    if keys.iter().any(|k| has_audio.iter().any(|m| m == k)) {
+        return false;
+    }
+    if keys.iter().any(|k| no_audio.iter().any(|m| m == k)) {
         return true;
     }
-    device
-        .cred_lookup_keys()
-        .iter()
-        .any(|k| marks.iter().any(|m| m == k))
+    device_has_no_audio(device)
 }
 
 /// Video=no and HLS=yes: local files are served as HLS (type 120 playlist URL).
@@ -3410,11 +3416,20 @@ mod tests {
     #[test]
     fn hisense_is_marked_no_audio_despite_audio_feature() {
         assert!(device_has_no_audio(&sample_tv()));
-        assert!(device_marked_no_audio(&sample_tv(), &[]));
+        assert!(device_marked_no_audio(&sample_tv(), &[], &[]));
+        assert!(!device_marked_no_audio(
+            &sample_tv(),
+            &[],
+            &["192.168.178.25:7000".into()]
+        ));
         let mut video = sample_tv();
         video.features = Some("0x7F8AD1,0x38BCF46".into());
         assert!(!device_has_no_audio(&video));
-        assert!(device_marked_no_audio(&video, &["192.168.178.25:7000".into()]));
+        assert!(device_marked_no_audio(
+            &video,
+            &["192.168.178.25:7000".into()],
+            &[]
+        ));
         let mut cast = sample_tv();
         cast.kind = crate::discovery::DeviceKind::Chromecast;
         assert!(!device_has_no_audio(&cast));

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::airplay::AirPlayClient;
@@ -111,6 +111,7 @@ enum NetResult {
     CastOk {
         session: crate::chromecast::CastSession,
         duration: f64,
+        note: &'static str,
     },
 }
 
@@ -131,6 +132,7 @@ pub struct App {
     pub selected_file: usize,
     pub scanning: bool,
     scan_rx: Option<oneshot::Receiver<Vec<MediaFile>>>,
+    tag_rx: Option<mpsc::UnboundedReceiver<(PathBuf, String)>>,
     pub folder_input: String,
     folder_completions: Vec<String>,
     folder_complete_idx: Option<usize>,
@@ -166,8 +168,12 @@ pub struct App {
     cast_session: Option<crate::chromecast::CastSession>,
     pub resume_offer: Option<(PathBuf, f64, f64)>,
     play_start: f64,
-    /// Saved + auto-detected TVs with no working audio (Hisense AirPlay).
+    /// User-marked picture-only receivers.
     pub no_audio: Vec<String>,
+    /// User override: receiver has sound.
+    pub has_audio: Vec<String>,
+    last_device: Option<String>,
+    show_net: bool,
 }
 
 impl App {
@@ -181,7 +187,10 @@ impl App {
             )
         };
         let folders = config::resolve_folders(cli_media_dir);
-        let no_audio = config::load().no_audio;
+        let cfg = config::load();
+        let no_audio = cfg.no_audio;
+        let has_audio = cfg.has_audio;
+        let last_device = cfg.last_device;
         let mut app = Self {
             screen: Screen::Discovery,
             should_quit: false,
@@ -197,6 +206,7 @@ impl App {
             selected_file: 0,
             scanning: false,
             scan_rx: None,
+            tag_rx: None,
             folder_input: String::new(),
             folder_completions: Vec::new(),
             folder_complete_idx: None,
@@ -229,6 +239,9 @@ impl App {
             resume_offer: None,
             play_start: 0.0,
             no_audio,
+            has_audio,
+            last_device,
+            show_net: false,
         };
         app.start_scan();
         Ok(app)
@@ -241,9 +254,8 @@ impl App {
     pub fn apply_discovery(&mut self, event: DiscoveryEvent) {
         match event {
             DiscoveryEvent::Found(device) => {
-                if crate::airplay::device_has_no_audio(&device) {
-                    self.remember_no_audio(&device);
-                }
+                let is_new = !self.devices.iter().any(|d| d.fullname == device.fullname);
+                let select_last = is_new && self.matches_last_device(&device);
                 if let Some(existing) = self
                     .devices
                     .iter_mut()
@@ -253,6 +265,15 @@ impl App {
                 } else {
                     self.devices.push(device);
                     self.devices.sort_by(|a, b| a.name.cmp(&b.name));
+                }
+                if select_last {
+                    if let Some(i) = self
+                        .devices
+                        .iter()
+                        .position(|d| self.matches_last_device(d))
+                    {
+                        self.selected_device = i;
+                    }
                 }
                 if self.screen == Screen::Discovery {
                     let n = self.devices.len();
@@ -307,6 +328,7 @@ impl App {
                 self.scanning = false;
                 self.files = files;
                 self.recompute_filter();
+                self.start_tag_probe();
                 if self.screen == Screen::Files {
                     self.status_files();
                 }
@@ -373,13 +395,26 @@ impl App {
                     self.queue_select_tv(device);
                 }
             }
+            KeyCode::Char('m') | KeyCode::Char('M') => self.toggle_selected_no_audio(),
+            KeyCode::Char('n') | KeyCode::Char('N') => self.toggle_net_panel(),
             _ => {}
         }
+    }
+
+    fn matches_last_device(&self, device: &AirPlayDevice) -> bool {
+        let Some(last) = self.last_device.as_deref() else {
+            return false;
+        };
+        device.cred_lookup_keys().iter().any(|k| k == last)
+            || device.fullname == last
+            || device.name == last
     }
 
     /// Pair when picking an AirPlay TV, then go to Files. Chromecast skips pairing.
     fn queue_select_tv(&mut self, device: AirPlayDevice) {
         crate::airplay::clear_net_log();
+        self.last_device = Some(device.cred_key());
+        let _ = config::persist_last_device(self.last_device.as_deref());
         self.device = Some(device.clone());
         self.airplay = None;
         self.play_ok = false;
@@ -401,26 +436,45 @@ impl App {
         self.mirroring = false;
         self.selected_mode = 1;
         self.screen = Screen::Mode;
-        let name = self
-            .device
-            .as_ref()
-            .map(|d| d.name.as_str())
-            .unwrap_or("TV");
-        self.status = format!("{name} — mirror this screen, or play a video");
+        self.status = "Ready".to_string();
     }
 
     pub fn shows_no_audio(&self, device: &AirPlayDevice) -> bool {
-        crate::airplay::device_marked_no_audio(device, &self.no_audio)
+        crate::airplay::device_marked_no_audio(device, &self.no_audio, &self.has_audio)
     }
 
-    fn remember_no_audio(&mut self, device: &AirPlayDevice) {
-        let key = device.cred_key();
-        if self.no_audio.iter().any(|k| k == &key) {
+    fn toggle_selected_no_audio(&mut self) {
+        let Some(device) = self.devices.get(self.selected_device).cloned() else {
             return;
+        };
+        self.toggle_no_audio(&device);
+        let name = &device.name;
+        self.status = if self.shows_no_audio(&device) {
+            format!("{name} — marked picture only, no audio")
+        } else {
+            format!("{name} — marked as having audio")
+        };
+    }
+
+    fn toggle_no_audio(&mut self, device: &AirPlayDevice) {
+        let key = device.cred_key();
+        let keys = device.cred_lookup_keys();
+        if self.shows_no_audio(device) {
+            self.no_audio.retain(|k| !keys.iter().any(|x| x == k));
+            if crate::airplay::device_has_no_audio(device)
+                && !self.has_audio.iter().any(|k| k == &key)
+            {
+                self.has_audio.push(key);
+            }
+        } else {
+            self.has_audio.retain(|k| !keys.iter().any(|x| x == k));
+            if !self.no_audio.iter().any(|k| k == &key) {
+                self.no_audio.push(key);
+            }
         }
-        self.no_audio.push(key);
         let mut cfg = config::load();
         cfg.no_audio.clone_from(&self.no_audio);
+        cfg.has_audio.clone_from(&self.has_audio);
         let _ = config::save(&cfg);
     }
 
@@ -452,6 +506,17 @@ impl App {
                     self.show_files();
                 }
             }
+            KeyCode::Char('m') | KeyCode::Char('M') => {
+                if let Some(device) = self.device.clone() {
+                    self.toggle_no_audio(&device);
+                    self.status = if self.shows_no_audio(&device) {
+                        format!("{} — marked picture only", device.name)
+                    } else {
+                        format!("{} — marked as having audio", device.name)
+                    };
+                }
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => self.toggle_net_panel(),
             _ => {}
         }
     }
@@ -464,9 +529,6 @@ impl App {
             self.start_scan();
         }
         self.status_files();
-        if let Some(device) = &self.device {
-            self.status = format!("{} — {}", device.name, self.status);
-        }
     }
 
     fn recompute_filter(&mut self) {
@@ -651,6 +713,7 @@ impl App {
             KeyCode::Char(c) if c.is_ascii_digit() && self.pin_buf.len() < 4 => {
                 self.pin_buf.push(c);
             }
+            KeyCode::Char('n') | KeyCode::Char('N') => self.toggle_net_panel(),
             _ => {}
         }
     }
@@ -718,10 +781,7 @@ impl App {
         }
         self.mirroring = true;
         self.queue_play_file(
-            MediaFile {
-                path: crate::capture::desktop_path(),
-                root: PathBuf::from("/"),
-            },
+            MediaFile::new(crate::capture::desktop_path(), PathBuf::from("/")),
             0.0,
         );
     }
@@ -873,10 +933,52 @@ impl App {
     }
 
     pub fn show_net_panel(&self) -> bool {
-        match self.screen {
-            Screen::Files | Screen::Mode | Screen::Pin | Screen::Control => true,
-            Screen::Discovery => self.busy.is_some() || self.device.is_some(),
-            Screen::AddFolder | Screen::Resume => false,
+        if matches!(self.screen, Screen::AddFolder | Screen::Resume) {
+            return false;
+        }
+        self.show_net || self.last_error.is_some()
+    }
+
+    fn toggle_net_panel(&mut self) {
+        self.show_net = !self.show_net;
+        self.status = if self.show_net {
+            "Net panel on".into()
+        } else {
+            "Net panel off".into()
+        };
+    }
+
+    fn start_tag_probe(&mut self) {
+        let paths: Vec<PathBuf> = self.files.iter().map(|f| f.path.clone()).collect();
+        if paths.is_empty() {
+            self.tag_rx = None;
+            return;
+        }
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::task::spawn_blocking(move || {
+            for path in paths {
+                let tag = files::probe_cast_tag(&path);
+                if tx.send((path, tag)).is_err() {
+                    break;
+                }
+            }
+        });
+        self.tag_rx = Some(rx);
+    }
+
+    fn poll_tags(&mut self) {
+        let Some(rx) = self.tag_rx.as_mut() else {
+            return;
+        };
+        let mut n = 0usize;
+        while let Ok((path, tag)) = rx.try_recv() {
+            if let Some(file) = self.files.iter_mut().find(|f| f.path == path) {
+                file.tag = tag;
+            }
+            n += 1;
+            if n > 32 {
+                break;
+            }
         }
     }
 
@@ -959,12 +1061,7 @@ impl App {
                 self.session_paired = true;
                 self.pin_from_discovery = false;
                 self.show_mode();
-                let name = self
-                    .device
-                    .as_ref()
-                    .map(|d| d.name.as_str())
-                    .unwrap_or("TV");
-                self.status = format!("{name} — paired, mirror this screen or play a video");
+                self.status = "Paired".to_string();
             }
             NetResult::NeedPin {
                 client,
@@ -1018,12 +1115,7 @@ impl App {
                 } else {
                     self.pin_from_discovery = false;
                     self.show_mode();
-                    let name = self
-                        .device
-                        .as_ref()
-                        .map(|d| d.name.as_str())
-                        .unwrap_or("TV");
-                    self.status = format!("{name} — paired, mirror this screen or play a video");
+                    self.status = "Paired".to_string();
                 }
             }
             NetResult::PinRetry { client, err, setup } => {
@@ -1092,7 +1184,11 @@ impl App {
                 self.status = err;
                 self.stay_on_files_not_playing();
             }
-            NetResult::CastOk { session, duration } => {
+            NetResult::CastOk {
+                session,
+                duration,
+                note,
+            } => {
                 self.cast_session = Some(session);
                 self.play_ok = true;
                 self.screen_cast = true;
@@ -1104,7 +1200,7 @@ impl App {
                     .as_ref()
                     .map(|d| d.name.as_str())
                     .unwrap_or("Chromecast");
-                self.status = format!("On {name}");
+                self.status = format!("On {name} — {note}");
                 self.goto_control_current(true);
                 self.duration = duration;
                 self.position = self.play_start;
@@ -1195,6 +1291,7 @@ impl App {
             KeyCode::Esc => {
                 self.stop_and_files().await;
             }
+            KeyCode::Char('n') | KeyCode::Char('N') => self.toggle_net_panel(),
             _ if self.screen_cast => {}
             KeyCode::Char(' ') => self.toggle_pause().await,
             KeyCode::Left if shift => self.seek(-60.0).await,
@@ -1383,6 +1480,7 @@ impl App {
 
     pub async fn on_tick(&mut self) {
         self.poll_scan();
+        self.poll_tags();
         self.poll_job();
         if let Some(kind) = self.busy {
             self.busy_tick = self.busy_tick.wrapping_add(1);
@@ -1593,7 +1691,11 @@ async fn job_play_chromecast(
     } else {
         crate::chromecast::start_cast(&ip, device.port, &file.path, media_port, start).await
     } {
-        Ok((session, duration)) => NetResult::CastOk { session, duration },
+        Ok((session, duration, note)) => NetResult::CastOk {
+            session,
+            duration,
+            note,
+        },
         Err(err) => NetResult::PlayFail {
             client: None,
             err,
@@ -1774,18 +1876,16 @@ pub fn help_text(screen: Screen) -> &'static str {
 
 pub fn help_text_cast(screen: Screen, screen_cast: bool) -> &'static str {
     match screen {
-        Screen::Discovery => "↑↓ select  Enter  r refresh  q quit",
-        Screen::Mode => "↑↓ select  Enter  Esc back",
+        Screen::Discovery => "↑↓  Enter  m no-audio  n net  r  q",
+        Screen::Mode => "↑↓  Enter  m no-audio  n net  Esc",
         Screen::Files => {
             "↑↓ select  type to search  Enter play  a add folder  d remove folder  Esc back"
         }
         Screen::AddFolder => "type path  Tab complete  Enter save  Esc cancel  ~ expands",
         Screen::Pin => "0–9 enter code  Enter confirm  Esc cancel",
         Screen::Resume => "Enter resume  n start over  Esc back",
-        Screen::Control if screen_cast => "Esc stop  q quit",
-        Screen::Control => {
-            "Space play/pause  ←→ 10s  Shift+←→ 1m  0–9 jump 10%  Home/End  Esc stop  q quit"
-        }
+        Screen::Control if screen_cast => "Esc  q quit",
+        Screen::Control => "Space  ←→  0–9  Esc",
     }
 }
 
@@ -1823,6 +1923,10 @@ mod tests {
         assert!(
             d.contains("enter"),
             "discovery help should mention Enter: {d}"
+        );
+        assert!(
+            d.contains("no-audio") || d.contains("no audio"),
+            "discovery help should mention m no-audio: {d}"
         );
         let f = help_text(Screen::Files).to_ascii_lowercase();
         assert!(!f.contains("pin"), "files help must not mention PIN: {f}");

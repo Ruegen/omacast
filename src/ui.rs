@@ -16,8 +16,6 @@ const ERR: Color = Color::Red;
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let help_h = match app.screen {
-        Screen::Control if app.screen_cast => 5,
-        Screen::Control => 11,
         Screen::Pin | Screen::Mode => 5,
         _ => 3,
     };
@@ -139,14 +137,19 @@ fn draw_discovery(frame: &mut Frame, app: &App, area: Rect) {
         .devices
         .iter()
         .map(|d| {
-            let audio = if app.shows_no_audio(d) { "  no audio" } else { "" };
-            let label = format!(
-                "{:<24}  {:<11}  {}{audio}",
-                d.name,
-                d.kind.label(),
-                d.addr_label()
-            );
-            ListItem::new(Line::from(label))
+            let mut spans = vec![
+                Span::raw(format!("{:<24}", d.name)),
+                Span::raw("  "),
+                Span::styled(d.kind.label(), Style::default().fg(DIM)),
+            ];
+            if app.shows_no_audio(d) {
+                spans.push(Span::styled("  ·  no audio", Style::default().fg(DIM)));
+            }
+            spans.push(Span::styled(
+                format!("  {}", d.addr_label()),
+                Style::default().fg(DIM),
+            ));
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -182,6 +185,15 @@ fn draw_mode(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         format!("on {device}")
     };
+    let (list_area, hint_area) = if no_audio {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(5), Constraint::Length(3)])
+            .split(area);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (area, None)
+    };
     let list = List::new(list_items)
         .block(title_block(&title))
         .highlight_style(
@@ -193,7 +205,15 @@ fn draw_mode(frame: &mut Frame, app: &App, area: Rect) {
         .highlight_symbol("▸ ");
     let mut state = ListState::default();
     state.select(Some(app.selected_mode.min(1)));
-    frame.render_stateful_widget(list, area, &mut state);
+    frame.render_stateful_widget(list, list_area, &mut state);
+    if let Some(hint_area) = hint_area {
+        let hint = Paragraph::new(
+            "Picture only (AirPlay screen TV, or you marked it). m to change.",
+        )
+            .style(Style::default().fg(DIM))
+            .wrap(Wrap { trim: false });
+        frame.render_widget(hint, hint_area);
+    }
 }
 
 fn draw_files(frame: &mut Frame, app: &App, area: Rect) {
@@ -204,7 +224,14 @@ fn draw_files(frame: &mut Frame, app: &App, area: Rect) {
         format!("/{}", app.filter)
     };
     let scan = if app.scanning { "  scanning..." } else { "" };
-    let title = format!("files  {filter}  {}{scan}", app.files.len());
+    let extra = if app.device.as_ref().is_some_and(|d| app.shows_no_audio(d)) {
+        "  ·  no audio"
+    } else if app.device.as_ref().is_some_and(|d| d.is_chromecast()) {
+        "  ·  picture + sound"
+    } else {
+        ""
+    };
+    let title = format!("files  {filter}  {}{scan}{extra}", app.files.len());
     let inner = title_block(&title);
 
     if app.filtered.is_empty() {
@@ -236,7 +263,20 @@ fn draw_files(frame: &mut Frame, app: &App, area: Rect) {
         .filtered
         .iter()
         .filter_map(|&i| app.files.get(i))
-        .map(|file| ListItem::new(Line::from(files::display_name(file, show_root))))
+        .map(|file| {
+            let name = files::display_name(file, show_root);
+            if file.tag.is_empty() {
+                ListItem::new(Line::from(name))
+            } else {
+                ListItem::new(Line::from(vec![
+                    Span::raw(name),
+                    Span::styled(
+                        format!("  {}", file.tag),
+                        Style::default().fg(DIM),
+                    ),
+                ]))
+            }
+        })
         .collect();
 
     let list = List::new(items)
@@ -466,53 +506,12 @@ fn draw_keys(frame: &mut Frame, app: &App, area: Rect) {
         ));
 
     let lines = match app.screen {
-        Screen::Control if app.screen_cast => vec![
-            Line::from(Span::styled(
-                help_text_cast(Screen::Control, true),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(vec![
-                key_name("Esc"),
-                Span::raw(if app.mirroring {
-                    " stop, back to menu    "
-                } else {
-                    " stop, back to files    "
-                }),
-                key_name("q"),
-                Span::raw(" stop and quit"),
-            ]),
-        ],
-        Screen::Control => vec![
-            Line::from(Span::styled(
-                help_text(Screen::Control),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(vec![key_name("Space"), Span::raw(" play / pause")]),
-            Line::from(vec![
-                key_name("Left / Right"),
-                Span::raw(" seek 10 seconds    "),
-                key_name("Shift+arrows  or  [ ]"),
-                Span::raw(" seek 1 minute"),
-            ]),
-            Line::from(vec![
-                key_name("0-9"),
-                Span::raw(" jump 0% 10% ... 90%    "),
-                key_name("Home / End"),
-                Span::raw(" start / end"),
-            ]),
-            Line::from(vec![
-                key_name("Esc"),
-                Span::raw(" stop, back to files    "),
-                key_name("q"),
-                Span::raw(" stop and quit"),
-            ]),
-        ],
+        Screen::Control => vec![Line::from(Span::styled(
+            help_text_cast(Screen::Control, app.screen_cast),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ))],
         Screen::Mode => vec![
             Line::from(Span::styled(
                 help_text(Screen::Mode),
@@ -545,16 +544,6 @@ fn draw_keys(frame: &mut Frame, app: &App, area: Rect) {
             .wrap(Wrap { trim: false }),
         area,
     );
-}
-
-fn key_name(label: &'static str) -> Span<'static> {
-    Span::styled(
-        format!(" {label} "),
-        Style::default()
-            .fg(Color::Black)
-            .bg(ACCENT)
-            .add_modifier(Modifier::BOLD),
-    )
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {

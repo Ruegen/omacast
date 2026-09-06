@@ -12,9 +12,15 @@ use crate::creds;
 pub struct AppConfig {
     #[serde(default)]
     pub folders: Vec<PathBuf>,
-    /// cred_key / host:port for TVs that cannot play sound (Hisense AirPlay).
+    /// User-marked picture-only receivers (any brand).
     #[serde(default)]
     pub no_audio: Vec<String>,
+    /// User override: this receiver has sound (wins over the AirPlay guess).
+    #[serde(default)]
+    pub has_audio: Vec<String>,
+    /// Last TV the user picked (`cred_key`). Highlighted on discovery; not auto-connected.
+    #[serde(default)]
+    pub last_device: Option<String>,
 }
 
 pub fn config_path() -> PathBuf {
@@ -104,6 +110,12 @@ pub fn resolve_folders(cli_media_dir: Option<PathBuf>) -> Vec<PathBuf> {
 pub fn persist_folders(folders: &[PathBuf]) -> io::Result<()> {
     let mut cfg = load();
     cfg.folders = folders.to_vec();
+    save(&cfg)
+}
+
+pub fn persist_last_device(key: Option<&str>) -> io::Result<()> {
+    let mut cfg = load();
+    cfg.last_device = key.map(str::to_string);
     save(&cfg)
 }
 
