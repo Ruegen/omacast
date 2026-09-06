@@ -49,13 +49,17 @@ pub fn spawn_frag_mp4() -> Result<DesktopPipe, String> {
 
 /// gpu-screen-recorder writing MKV to stdout (`-o /dev/stdout`).
 pub fn spawn_recorder(audio: bool) -> Result<Child, String> {
+    spawn_recorder_keyint(audio, 30)
+}
+
+fn spawn_recorder_keyint(audio: bool, keyint: u32) -> Result<Child, String> {
     if !Path::new(GSR).is_file() {
         return Err("gpu-screen-recorder is not installed".into());
     }
     let monitor = monitor_name();
     let mut recorder = Command::new(GSR);
     recorder
-        .args(gsr_args(&monitor, audio))
+        .args(gsr_args(&monitor, audio, keyint))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -77,7 +81,7 @@ fn spawn_pipeline(audio: bool, kind: OutKind) -> Result<DesktopPipe, String> {
         return Err("ffmpeg is not installed".into());
     }
 
-    let mut recorder = spawn_recorder(audio)?;
+    let mut recorder = spawn_recorder_keyint(audio, 30)?;
     let rec_out = recorder
         .stdout
         .take()
@@ -87,6 +91,8 @@ fn spawn_pipeline(audio: bool, kind: OutKind) -> Result<DesktopPipe, String> {
         .map_err(|e| format!("gpu-screen-recorder stdout: {e}"))?;
 
     let mut ffmpeg = Command::new(FFMPEG);
+    // Default probe — GSR needs ~1s to attach KMS before it writes. A short
+    // analyzeduration made Chromecast GET a broken/empty fMP4 (blank TV).
     ffmpeg.args([
         "-nostdin",
         "-hide_banner",
@@ -249,7 +255,7 @@ fn hypr_focused_monitor() -> Option<String> {
         .map(str::to_string)
 }
 
-fn gsr_args(monitor: &str, audio: bool) -> Vec<String> {
+fn gsr_args(monitor: &str, audio: bool, keyint: u32) -> Vec<String> {
     let mut a = vec![
         "-w".into(),
         monitor.into(),
@@ -264,7 +270,7 @@ fn gsr_args(monitor: &str, audio: bool) -> Vec<String> {
         "-cursor".into(),
         "yes".into(),
         "-keyint".into(),
-        "30".into(),
+        keyint.to_string(),
         "-fm".into(),
         "cfr".into(),
         "-fallback-cpu-encoding".into(),
@@ -296,13 +302,15 @@ mod tests {
 
     #[test]
     fn recorder_uses_monitor_and_dev_stdout() {
-        let joined = gsr_args("HDMI-A-1", false).join(" ");
+        let joined = gsr_args("HDMI-A-1", false, 30).join(" ");
         assert!(joined.contains("-w HDMI-A-1"), "{joined}");
         assert!(joined.contains("-s 1920x1080"), "{joined}");
         assert!(joined.contains("-o /dev/stdout"), "{joined}");
+        assert!(joined.contains("-keyint 30"), "{joined}");
         assert!(!joined.contains("-w focused"), "{joined}");
         assert!(!joined.contains("-o -"), "{joined}");
-        let with_a = gsr_args("HDMI-A-1", true).join(" ");
+        let with_a = gsr_args("HDMI-A-1", true, 15).join(" ");
         assert!(with_a.contains("default_output"), "{with_a}");
+        assert!(with_a.contains("-keyint 15"), "{with_a}");
     }
 }
