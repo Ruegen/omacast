@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::OnceLock;
 
 use tokio::io::AsyncReadExt;
 use tokio::process::{Child, ChildStdout, Command};
@@ -76,12 +77,22 @@ fn spawn_recorder_keyint(audio: bool, keyint: u32) -> Result<Child, String> {
     Ok(recorder)
 }
 
+/// Attach ffmpeg to an already-running recorder (KMS warm, no encoded backlog).
+pub fn spawn_frag_mp4_from(recorder: Child) -> Result<DesktopPipe, String> {
+    attach_ffmpeg(recorder, OutKind::FragMp4)
+}
+
 fn spawn_pipeline(audio: bool, kind: OutKind) -> Result<DesktopPipe, String> {
+    let recorder = spawn_recorder_keyint(audio, 30)?;
+    attach_ffmpeg(recorder, kind)
+}
+
+fn attach_ffmpeg(mut recorder: Child, kind: OutKind) -> Result<DesktopPipe, String> {
     if !Path::new(FFMPEG).is_file() {
+        let _ = recorder.start_kill();
         return Err("ffmpeg is not installed".into());
     }
 
-    let mut recorder = spawn_recorder_keyint(audio, 30)?;
     let rec_out = recorder
         .stdout
         .take()
@@ -90,19 +101,19 @@ fn spawn_pipeline(audio: bool, kind: OutKind) -> Result<DesktopPipe, String> {
         .into_owned_fd()
         .map_err(|e| format!("gpu-screen-recorder stdout: {e}"))?;
 
+    let vaapi = match kind {
+        OutKind::FragMp4 => vaapi_h264_device(),
+        OutKind::AnnexB => None,
+    };
+
     let mut ffmpeg = Command::new(FFMPEG);
     // Default probe — GSR needs ~1s to attach KMS before it writes. A short
     // analyzeduration made Chromecast GET a broken/empty fMP4 (blank TV).
-    ffmpeg.args([
-        "-nostdin",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-fflags",
-        "+genpts",
-        "-i",
-        "pipe:0",
-    ]);
+    ffmpeg.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
+    if let Some(dev) = vaapi {
+        ffmpeg.args(["-vaapi_device", dev]);
+    }
+    ffmpeg.args(["-fflags", "+genpts", "-i", "pipe:0"]);
     match kind {
         OutKind::AnnexB => {
             ffmpeg.args([
@@ -126,22 +137,49 @@ fn spawn_pipeline(audio: bool, kind: OutKind) -> Result<DesktopPipe, String> {
                 "0:v:0",
                 "-map",
                 "1:a:0",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-tune",
-                "zerolatency",
-                "-profile:v",
-                "high",
-                "-level",
-                "4.1",
-                "-pix_fmt",
-                "yuv420p",
-                "-g",
-                "30",
-                "-bf",
-                "0",
+            ]);
+            if let Some(dev) = vaapi {
+                crate::airplay::debug_log(&format!("chromecast desktop encode h264_vaapi {dev}"));
+                ffmpeg.args([
+                    "-vf",
+                    "format=nv12,hwupload",
+                    "-c:v",
+                    "h264_vaapi",
+                    "-profile:v",
+                    "high",
+                    "-level",
+                    "41",
+                    "-bf",
+                    "0",
+                    "-g",
+                    "15",
+                    "-quality",
+                    "4",
+                ]);
+            } else {
+                crate::airplay::debug_log("chromecast desktop encode libx264");
+                ffmpeg.args([
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-tune",
+                    "zerolatency",
+                    "-profile:v",
+                    "high",
+                    "-level",
+                    "4.1",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-g",
+                    "15",
+                    "-bf",
+                    "0",
+                    "-x264-params",
+                    "keyint=15:min-keyint=15:scenecut=0:bframes=0:rc-lookahead=0:sync-lookahead=0:sliced-threads=1:mbtree=0",
+                ]);
+            }
+            ffmpeg.args([
                 "-c:a",
                 "aac",
                 "-b:a",
@@ -150,6 +188,10 @@ fn spawn_pipeline(audio: bool, kind: OutKind) -> Result<DesktopPipe, String> {
                 "2",
                 "-ar",
                 "44100",
+                "-muxdelay",
+                "0",
+                "-muxpreload",
+                "0",
                 "-f",
                 "mp4",
                 "-movflags",
@@ -255,6 +297,29 @@ fn hypr_focused_monitor() -> Option<String> {
         .map(str::to_string)
 }
 
+/// `/dev/dri/renderD*` + ffmpeg `h264_vaapi`. Cached. AirPlay still copies GSR.
+fn vaapi_h264_device() -> Option<&'static str> {
+    static DEV: OnceLock<Option<String>> = OnceLock::new();
+    DEV.get_or_init(|| {
+        const NODES: &[&str] = &["/dev/dri/renderD128", "/dev/dri/renderD129"];
+        let node = NODES.iter().copied().find(|p| Path::new(p).exists())?;
+        if !ffmpeg_has_h264_vaapi() {
+            return None;
+        }
+        Some(node.to_string())
+    })
+    .as_deref()
+}
+
+fn ffmpeg_has_h264_vaapi() -> bool {
+    std::process::Command::new(FFMPEG)
+        .args(["-hide_banner", "-encoders"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("h264_vaapi"))
+        .unwrap_or(false)
+}
+
 fn gsr_args(monitor: &str, audio: bool, keyint: u32) -> Vec<String> {
     let mut a = vec![
         "-w".into(),
@@ -291,7 +356,7 @@ fn gsr_args(monitor: &str, audio: bool, keyint: u32) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{desktop_path, gsr_args, is_desktop};
+    use super::{desktop_path, gsr_args, is_desktop, vaapi_h264_device};
 
     #[test]
     fn sentinel_path_is_stable() {
@@ -312,5 +377,10 @@ mod tests {
         let with_a = gsr_args("HDMI-A-1", true, 15).join(" ");
         assert!(with_a.contains("default_output"), "{with_a}");
         assert!(with_a.contains("-keyint 15"), "{with_a}");
+    }
+
+    #[test]
+    fn vaapi_detect_does_not_panic() {
+        let _ = vaapi_h264_device();
     }
 }

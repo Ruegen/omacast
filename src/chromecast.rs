@@ -88,8 +88,7 @@ pub async fn start_cast(
     media_port: u16,
     start: f64,
 ) -> Result<(CastSession, f64), String> {
-    let duration = probe_duration(file).await;
-    let source = decide_cast_source(file).await;
+    let (duration, source) = tokio::join!(probe_duration(file), decide_cast_source(file));
     let slug = uuid::Uuid::new_v4().simple().to_string();
     let server = match bind_on_open_port(file.to_path_buf(), media_port, ip, &slug, source, start)
         .await
@@ -105,11 +104,29 @@ pub async fn start_cast(
 
     let mut conn = CastConn::connect(ip, port).await?;
     if let Err(err) = conn
-        .launch_and_load(&url, "video/mp4", stream_type, start)
+        .launch_and_load(&url, "video/mp4", stream_type, start, false)
         .await
     {
         drop(server);
         return Err(err);
+    }
+
+    if !wait_for_remote_get(&server, Duration::from_secs(3)).await {
+        crate::airplay::debug_log("chromecast movie GET miss, relaunch default receiver");
+        if let Err(err) = conn
+            .launch_and_load(&url, "video/mp4", stream_type, start, true)
+            .await
+        {
+            drop(server);
+            return Err(err);
+        }
+        if !wait_for_remote_get(&server, Duration::from_secs(10)).await {
+            drop(server);
+            return Err(
+                "Chromecast could not fetch the file from this PC (inbound TCP still blocked)."
+                    .to_string(),
+            );
+        }
     }
 
     let finished = Arc::new(AtomicBool::new(false));
@@ -119,15 +136,6 @@ pub async fn start_cast(
         conn.pump_until_idle(stop_rx).await;
         flag.store(true, Ordering::Relaxed);
     });
-
-    if !wait_for_remote_get(&server, Duration::from_secs(10)).await {
-        let _ = stop_tx.send(());
-        drop(server);
-        return Err(
-            "Chromecast could not fetch the file from this PC (inbound TCP still blocked)."
-                .to_string(),
-        );
-    }
 
     Ok((
         CastSession {
@@ -163,7 +171,7 @@ pub async fn start_cast_desktop(
 
     let mut conn = CastConn::connect(ip, port).await?;
     if let Err(err) = conn
-        .launch_and_load(&url, "video/mp4", "LIVE", 0.0)
+        .launch_and_load(&url, "video/mp4", "LIVE", 0.0, true)
         .await
     {
         drop(server);

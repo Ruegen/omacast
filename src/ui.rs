@@ -139,7 +139,13 @@ fn draw_discovery(frame: &mut Frame, app: &App, area: Rect) {
         .devices
         .iter()
         .map(|d| {
-            let label = format!("{:<24}  {:<11}  {}", d.name, d.kind.label(), d.addr_label());
+            let audio = if app.shows_no_audio(d) { "  no audio" } else { "" };
+            let label = format!(
+                "{:<24}  {:<11}  {}{audio}",
+                d.name,
+                d.kind.label(),
+                d.addr_label()
+            );
             ListItem::new(Line::from(label))
         })
         .collect();
@@ -162,6 +168,7 @@ fn draw_discovery(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_mode(frame: &mut Frame, app: &App, area: Rect) {
     let area = split_busy(frame, app, area);
     let device = app.device.as_ref().map(|d| d.name.as_str()).unwrap_or("TV");
+    let no_audio = app.device.as_ref().is_some_and(|d| app.shows_no_audio(d));
     let items = [
         "Mirror this screen",
         "Play a video",
@@ -170,7 +177,11 @@ fn draw_mode(frame: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|label| ListItem::new(Line::from(*label)))
         .collect();
-    let title = format!("on {device}");
+    let title = if no_audio {
+        format!("on {device}  ·  no audio")
+    } else {
+        format!("on {device}")
+    };
     let list = List::new(list_items)
         .block(title_block(&title))
         .highlight_style(
@@ -352,7 +363,9 @@ fn draw_control(frame: &mut Frame, app: &App, area: Rect) {
         ])
         .split(area);
 
-    let device = app.device.as_ref().map(|d| d.name.as_str()).unwrap_or("—");
+    let device_ref = app.device.as_ref();
+    let device = device_ref.map(|d| d.name.as_str()).unwrap_or("—");
+    let no_audio = device_ref.is_some_and(|d| app.shows_no_audio(d));
     let file = if app.mirroring {
         "This screen".to_string()
     } else {
@@ -362,8 +375,12 @@ fn draw_control(frame: &mut Frame, app: &App, area: Rect) {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "—".into())
     };
-    let state = if app.mirroring {
+    let state = if app.mirroring && no_audio {
+        format!("mirroring — picture only, no audio on {device}")
+    } else if app.mirroring {
         format!("mirroring — on {device}")
+    } else if no_audio {
+        format!("picture only — no audio on {device}")
     } else if app.device.as_ref().is_some_and(|d| d.is_chromecast()) {
         format!("Chromecast — picture + sound on {device}")
     } else if app.screen_cast {

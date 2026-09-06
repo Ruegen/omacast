@@ -77,6 +77,7 @@ pub struct CastConn {
     request_id: u64,
     transport_id: Option<String>,
     media_session_id: Option<i64>,
+    default_receiver: bool,
 }
 
 struct Incoming {
@@ -107,6 +108,7 @@ impl CastConn {
             request_id: 1,
             transport_id: None,
             media_session_id: None,
+            default_receiver: false,
         };
         conn.send(RECEIVER, NS_CONN, &json!({"type":"CONNECT"}))
             .await?;
@@ -125,6 +127,7 @@ impl CastConn {
         content_type: &str,
         stream_type: &str,
         start: f64,
+        force_relaunch: bool,
     ) -> Result<(), String> {
         let id = self.next_id();
         self.send(
@@ -133,28 +136,35 @@ impl CastConn {
             &json!({"type":"GET_STATUS","requestId": id}),
         )
         .await?;
-        self.wait_transport(Duration::from_secs(3)).await.ok();
+        self.collect_status(Duration::from_millis(500)).await;
 
-        // Always quit the current app. A failed desktop/HLS LOAD leaves the
-        // default receiver running but deaf — later movie LOADs never GET.
-        let id = self.next_id();
-        let _ = self
-            .send(RECEIVER, NS_RECV, &json!({"type":"STOP","requestId": id}))
-            .await;
-        self.transport_id = None;
-        self.media_session_id = None;
-        self.drain_for(Duration::from_millis(400)).await;
-        self.transport_id = None;
-        self.media_session_id = None;
+        let reuse = !force_relaunch && self.default_receiver && self.transport_id.is_some();
+        if !reuse {
+            if self.transport_id.is_some() {
+                let id = self.next_id();
+                let _ = self
+                    .send(RECEIVER, NS_RECV, &json!({"type":"STOP","requestId": id}))
+                    .await;
+                self.transport_id = None;
+                self.media_session_id = None;
+                self.default_receiver = false;
+                self.collect_status(Duration::from_millis(250)).await;
+                self.transport_id = None;
+                self.media_session_id = None;
+                self.default_receiver = false;
+            }
+            let id = self.next_id();
+            self.send(
+                RECEIVER,
+                NS_RECV,
+                &json!({"type":"LAUNCH","appId": DEFAULT_APP,"requestId": id}),
+            )
+            .await?;
+            self.wait_transport(Duration::from_secs(12)).await?;
+        } else {
+            crate::airplay::debug_log("chromecast reuse default receiver");
+        }
 
-        let id = self.next_id();
-        self.send(
-            RECEIVER,
-            NS_RECV,
-            &json!({"type":"LAUNCH","appId": DEFAULT_APP,"requestId": id}),
-        )
-        .await?;
-        self.wait_transport(Duration::from_secs(12)).await?;
         let transport = self
             .transport_id
             .clone()
@@ -175,9 +185,26 @@ impl CastConn {
             }
         });
         self.send(&transport, NS_MEDIA, &load).await?;
-        let started = self.wait_media_started(Duration::from_secs(15)).await;
+        // LOAD is enough to start the GET. Do not block 15s for MEDIA_STATUS.
+        let started = self.wait_media_started(Duration::from_secs(2)).await;
         let _ = self.set_volume(CAST_VOLUME).await;
         started
+    }
+
+    async fn collect_status(&mut self, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while tokio::time::Instant::now() < deadline {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(left, self.recv()).await {
+                Ok(Ok(msg)) => {
+                    self.handle_incoming(msg);
+                    if self.transport_id.is_some() {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
     }
 
     async fn drain_for(&mut self, dur: Duration) {
@@ -317,7 +344,14 @@ impl CastConn {
             {
                 for app in apps {
                     let id = app.get("appId").and_then(Value::as_str).unwrap_or("");
-                    if id == DEFAULT_APP || id.is_empty() || apps.len() == 1 {
+                    if id == DEFAULT_APP {
+                        if let Some(tid) = app.get("transportId").and_then(Value::as_str) {
+                            self.transport_id = Some(tid.to_string());
+                            self.default_receiver = true;
+                        }
+                    } else if !self.default_receiver
+                        && (id.is_empty() || apps.len() == 1)
+                    {
                         if let Some(tid) = app.get("transportId").and_then(Value::as_str) {
                             self.transport_id = Some(tid.to_string());
                         }

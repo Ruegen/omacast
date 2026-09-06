@@ -106,6 +106,9 @@ struct MediaState {
     start_at: f64,
     lan_ip: Ipv4Addr,
     gets: Arc<AtomicU64>,
+    /// Warm gpu-screen-recorder only. ffmpeg starts on GET so we do not
+    /// queue stale encoded fragments (that added seconds of delay).
+    gsr: Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -201,6 +204,18 @@ impl MediaServer {
         let gets = Arc::new(AtomicU64::new(0));
         let is_hls = hls.is_some();
 
+        let gsr = Arc::new(tokio::sync::Mutex::new(None));
+        if live == LiveKind::Desktop {
+            match crate::capture::spawn_recorder(false) {
+                Ok(child) => {
+                    crate::airplay::debug_log("chromecast desktop gsr warm");
+                    if let Ok(mut slot) = gsr.try_lock() {
+                        *slot = Some(child);
+                    }
+                }
+                Err(err) => crate::airplay::debug_log(&format!("desktop gsr warm: {err}")),
+            }
+        }
         let state = MediaState {
             path: Arc::new(path),
             hls: is_hls,
@@ -208,6 +223,7 @@ impl MediaServer {
             start_at,
             lan_ip,
             gets: gets.clone(),
+            gsr,
         };
         let app = if is_hls {
             Router::new().fallback(serve_media).with_state(state)
@@ -376,7 +392,7 @@ async fn serve_media_body(
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
     if state.live != LiveKind::Off {
-        return serve_live_ffmpeg(method, &state);
+        return serve_live_ffmpeg(method, &state).await;
     }
 
     let (file_path, content_type) = if state.hls {
@@ -397,7 +413,7 @@ async fn serve_media_body(
     serve_file(method, headers, &file_path, content_type).await
 }
 
-fn serve_live_ffmpeg(method: Method, state: &MediaState) -> Response {
+async fn serve_live_ffmpeg(method: Method, state: &MediaState) -> Response {
     let builder = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "video/mp4")
@@ -446,7 +462,7 @@ fn serve_live_ffmpeg(method: Method, state: &MediaState) -> Response {
             ]);
         }
         LiveKind::Desktop => {
-            return serve_desktop_live(method, builder);
+            return serve_desktop_live(state, builder).await;
         }
         LiveKind::Off => unreachable!(),
     }
@@ -485,13 +501,29 @@ fn serve_live_ffmpeg(method: Method, state: &MediaState) -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-fn serve_desktop_live(_method: Method, builder: axum::http::response::Builder) -> Response {
-    let pipe = match crate::capture::spawn_frag_mp4() {
-        Ok(p) => p,
-        Err(err) => {
-            crate::airplay::debug_log(&format!("desktop live: {err}"));
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
+async fn serve_desktop_live(
+    state: &MediaState,
+    builder: axum::http::response::Builder,
+) -> Response {
+    let warmed = state.gsr.lock().await.take();
+    let pipe = match warmed {
+        Some(recorder) => match crate::capture::spawn_frag_mp4_from(recorder) {
+            Ok(p) => {
+                crate::airplay::debug_log("chromecast desktop live (warm gsr)");
+                p
+            }
+            Err(err) => {
+                crate::airplay::debug_log(&format!("desktop live: {err}"));
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        },
+        None => match crate::capture::spawn_frag_mp4() {
+            Ok(p) => p,
+            Err(err) => {
+                crate::airplay::debug_log(&format!("desktop live: {err}"));
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        },
     };
     let mut ffmpeg = pipe.ffmpeg;
     let mut recorder = pipe.recorder;

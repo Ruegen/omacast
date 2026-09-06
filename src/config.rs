@@ -12,6 +12,9 @@ use crate::creds;
 pub struct AppConfig {
     #[serde(default)]
     pub folders: Vec<PathBuf>,
+    /// cred_key / host:port for TVs that cannot play sound (Hisense AirPlay).
+    #[serde(default)]
+    pub no_audio: Vec<String>,
 }
 
 pub fn config_path() -> PathBuf {
@@ -99,9 +102,9 @@ pub fn resolve_folders(cli_media_dir: Option<PathBuf>) -> Vec<PathBuf> {
 }
 
 pub fn persist_folders(folders: &[PathBuf]) -> io::Result<()> {
-    save(&AppConfig {
-        folders: folders.to_vec(),
-    })
+    let mut cfg = load();
+    cfg.folders = folders.to_vec();
+    save(&cfg)
 }
 
 /// Directory matches for Tab-complete. Paths keep a `~/` prefix when the user typed `~`.

@@ -166,6 +166,8 @@ pub struct App {
     cast_session: Option<crate::chromecast::CastSession>,
     pub resume_offer: Option<(PathBuf, f64, f64)>,
     play_start: f64,
+    /// Saved + auto-detected TVs with no working audio (Hisense AirPlay).
+    pub no_audio: Vec<String>,
 }
 
 impl App {
@@ -179,6 +181,7 @@ impl App {
             )
         };
         let folders = config::resolve_folders(cli_media_dir);
+        let no_audio = config::load().no_audio;
         let mut app = Self {
             screen: Screen::Discovery,
             should_quit: false,
@@ -225,6 +228,7 @@ impl App {
             cast_session: None,
             resume_offer: None,
             play_start: 0.0,
+            no_audio,
         };
         app.start_scan();
         Ok(app)
@@ -237,6 +241,9 @@ impl App {
     pub fn apply_discovery(&mut self, event: DiscoveryEvent) {
         match event {
             DiscoveryEvent::Found(device) => {
+                if crate::airplay::device_has_no_audio(&device) {
+                    self.remember_no_audio(&device);
+                }
                 if let Some(existing) = self
                     .devices
                     .iter_mut()
@@ -400,6 +407,21 @@ impl App {
             .map(|d| d.name.as_str())
             .unwrap_or("TV");
         self.status = format!("{name} — mirror this screen, or play a video");
+    }
+
+    pub fn shows_no_audio(&self, device: &AirPlayDevice) -> bool {
+        crate::airplay::device_marked_no_audio(device, &self.no_audio)
+    }
+
+    fn remember_no_audio(&mut self, device: &AirPlayDevice) {
+        let key = device.cred_key();
+        if self.no_audio.iter().any(|k| k == &key) {
+            return;
+        }
+        self.no_audio.push(key);
+        let mut cfg = config::load();
+        cfg.no_audio.clone_from(&self.no_audio);
+        let _ = config::save(&cfg);
     }
 
     fn leave_device(&mut self) {
