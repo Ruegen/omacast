@@ -84,6 +84,7 @@ const FFMPEG_X264: &[&str] = &[
 
 pub struct ScreenStream {
     child: Option<Child>,
+    sidecar: Option<Child>,
     task: Option<tokio::task::JoinHandle<()>>,
     frames: Arc<AtomicU64>,
     bytes: Arc<AtomicU64>,
@@ -117,6 +118,9 @@ impl ScreenStream {
         }
         if let Some(mut child) = self.child.take() {
             let _ = child.start_kill();
+        }
+        if let Some(mut sidecar) = self.sidecar.take() {
+            let _ = sidecar.start_kill();
         }
     }
 
@@ -290,16 +294,66 @@ pub async fn start_screen_stream(
         });
     }
 
+    run_screen_child(child, None, stdout, host, data_port, width, height, crypto, log).await
+}
+
+/// Live desktop → annex-B H264 → type 110. Same framing as a file encode.
+pub async fn start_desktop_stream(
+    host: &str,
+    data_port: u16,
+    crypto: Option<PayloadCrypto>,
+    log: impl Fn(&str) + Send + Sync + 'static,
+) -> Option<ScreenStream> {
+    let log: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(log);
+    let pipe = match crate::capture::spawn_h264() {
+        Ok(p) => p,
+        Err(err) => {
+            log(&format!("desktop capture: {err}"));
+            return None;
+        }
+    };
+    log("desktop: gpu-screen-recorder 1920x1080 → type 110");
+    run_screen_child(
+        pipe.ffmpeg,
+        Some(pipe.recorder),
+        pipe.stdout,
+        host,
+        data_port,
+        DEFAULT_W,
+        DEFAULT_H,
+        crypto,
+        log,
+    )
+    .await
+}
+
+async fn run_screen_child(
+    mut child: Child,
+    mut sidecar: Option<Child>,
+    stdout: tokio::process::ChildStdout,
+    host: &str,
+    data_port: u16,
+    width: f32,
+    height: f32,
+    crypto: Option<PayloadCrypto>,
+    log: Arc<dyn Fn(&str) + Send + Sync>,
+) -> Option<ScreenStream> {
     let connect = TcpStream::connect((host, data_port));
     let stream = match tokio::time::timeout(Duration::from_secs(2), connect).await {
         Ok(Ok(s)) => s,
         Ok(Err(err)) => {
             let _ = child.start_kill();
+            if let Some(mut side) = sidecar.take() {
+                let _ = side.start_kill();
+            }
             log(&format!("dataPort {data_port} connect fail: {err}"));
             return None;
         }
         Err(_) => {
             let _ = child.start_kill();
+            if let Some(mut side) = sidecar.take() {
+                let _ = side.start_kill();
+            }
             log(&format!("dataPort {data_port} connect timeout"));
             return None;
         }
@@ -339,6 +393,7 @@ pub async fn start_screen_stream(
 
     Some(ScreenStream {
         child: Some(child),
+        sidecar,
         task: Some(task),
         frames,
         bytes,

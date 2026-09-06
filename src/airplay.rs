@@ -908,9 +908,31 @@ impl AirPlayClient {
         }
     }
 
+    async fn record_screen(&mut self) -> bool {
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            self.request_rtsp("RECORD", &[], b""),
+        )
+        .await
+        {
+            Ok(Ok(record)) => {
+                debug_status("RECORD", record.status);
+                record.is_success()
+            }
+            Ok(Err(err)) => {
+                debug_status_msg("RECORD", &err);
+                false
+            }
+            Err(_) => {
+                debug_log("RECORD timed out");
+                false
+            }
+        }
+    }
+
     async fn teardown_rtsp(&mut self) {
         match tokio::time::timeout(
-            Duration::from_millis(500),
+            Duration::from_secs(2),
             self.request_rtsp("TEARDOWN", &[], b""),
         )
         .await
@@ -1756,10 +1778,17 @@ impl AirPlayClient {
         };
         self.stop_screen_stream();
         let host = self.host.clone();
-        let started = screen::start_screen_stream(&host, data_port, file, crypto, |line| {
-            debug_log(line);
-        })
-        .await;
+        let started = if crate::capture::is_desktop(file) {
+            screen::start_desktop_stream(&host, data_port, crypto, |line| {
+                debug_log(line);
+            })
+            .await
+        } else {
+            screen::start_screen_stream(&host, data_port, file, crypto, |line| {
+                debug_log(line);
+            })
+            .await
+        };
         if let Some(stream) = started {
             self.screen = Some(stream);
         }
@@ -2172,21 +2201,29 @@ impl AirPlayClient {
             .await
         {
             Ok(ScreenStreamSetup::Port(port)) => {
+                let mut port = port;
                 // RECORD before ffmpeg so the TV is ready before the first frame.
-                match tokio::time::timeout(
-                    Duration::from_secs(5),
-                    self.request_rtsp("RECORD", &[], b""),
-                )
-                .await
-                {
-                    Ok(Ok(record)) => {
-                        debug_status("RECORD", record.status);
-                        if record.is_success() {
-                            self.set_screen_volume_after_record().await;
+                let mut recorded = self.record_screen().await;
+                if !recorded {
+                    debug_log("RECORD failed, TEARDOWN and retry SETUP 110");
+                    self.teardown_rtsp().await;
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    match self
+                        .setup_type_110_once_fp(ekey, eiv, timing_port, control_port)
+                        .await
+                    {
+                        Ok(ScreenStreamSetup::Port(p)) => {
+                            port = p;
+                            recorded = self.record_screen().await;
                         }
+                        _ => debug_log("SETUP 110 retry failed"),
                     }
-                    Ok(Err(err)) => debug_status_msg("RECORD", &err),
-                    Err(_) => debug_log("RECORD timed out"),
+                }
+                if recorded {
+                    self.set_screen_volume_after_record().await;
+                } else if local_file.is_some_and(crate::capture::is_desktop) {
+                    debug_log("RECORD still failing; not sending desktop frames");
+                    return Ok(false);
                 }
                 let crypto = match vcl_crypto {
                     VclCryptoKind::None => None,
@@ -2754,13 +2791,20 @@ impl AirPlayClient {
         }
     }
 
-    /// Kill ffmpeg, TEARDOWN the screen session, then POST /stop for HTTP play.
+    /// TEARDOWN while RTSP is still up, then kill ffmpeg. Killing the data
+    /// stream first makes Hisense drop the control socket and the next RECORD is 500.
     pub async fn stop(&mut self) -> Result<(), String> {
         let had_screen = self.screen.is_some();
-        self.stop_screen_stream();
         if had_screen {
             self.teardown_rtsp().await;
+            let _ = tokio::time::timeout(
+                Duration::from_secs(1),
+                self.request("POST", "/stop", &[], b""),
+            )
+            .await;
+            self.stop_screen_stream();
             self.play_ok = false;
+            tokio::time::sleep(Duration::from_millis(500)).await;
             return Ok(());
         }
         if !self.play_ok {

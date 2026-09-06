@@ -18,7 +18,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     let help_h = match app.screen {
         Screen::Control if app.screen_cast => 5,
         Screen::Control => 11,
-        Screen::Pin => 5,
+        Screen::Pin | Screen::Mode => 5,
         _ => 3,
     };
     let net_h = if app.show_net_panel() { 8 } else { 0 };
@@ -34,6 +34,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 
     match app.screen {
         Screen::Discovery => draw_discovery(frame, app, chunks[0]),
+        Screen::Mode => draw_mode(frame, app, chunks[0]),
         Screen::Files => draw_files(frame, app, chunks[0]),
         Screen::AddFolder => draw_add_folder(frame, app, chunks[0]),
         Screen::Pin => draw_pin(frame, app, chunks[0]),
@@ -155,6 +156,32 @@ fn draw_discovery(frame: &mut Frame, app: &App, area: Rect) {
 
     let mut state = ListState::default();
     state.select(Some(app.selected_device.min(app.devices.len() - 1)));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_mode(frame: &mut Frame, app: &App, area: Rect) {
+    let area = split_busy(frame, app, area);
+    let device = app.device.as_ref().map(|d| d.name.as_str()).unwrap_or("TV");
+    let items = [
+        "Mirror this screen",
+        "Play a video",
+    ];
+    let list_items: Vec<ListItem> = items
+        .iter()
+        .map(|label| ListItem::new(Line::from(*label)))
+        .collect();
+    let title = format!("on {device}");
+    let list = List::new(list_items)
+        .block(title_block(&title))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▸ ");
+    let mut state = ListState::default();
+    state.select(Some(app.selected_mode.min(1)));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -326,13 +353,18 @@ fn draw_control(frame: &mut Frame, app: &App, area: Rect) {
         .split(area);
 
     let device = app.device.as_ref().map(|d| d.name.as_str()).unwrap_or("—");
-    let file = app
-        .current_file
-        .as_ref()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "—".into());
-    let state = if app.device.as_ref().is_some_and(|d| d.is_chromecast()) {
+    let file = if app.mirroring {
+        "This screen".to_string()
+    } else {
+        app.current_file
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "—".into())
+    };
+    let state = if app.mirroring {
+        format!("mirroring — on {device}")
+    } else if app.device.as_ref().is_some_and(|d| d.is_chromecast()) {
         format!("Chromecast — picture + sound on {device}")
     } else if app.screen_cast {
         format!("sending to the TV — on {device}")
@@ -427,7 +459,11 @@ fn draw_keys(frame: &mut Frame, app: &App, area: Rect) {
             Line::from(""),
             Line::from(vec![
                 key_name("Esc"),
-                Span::raw(" stop, back to files    "),
+                Span::raw(if app.mirroring {
+                    " stop, back to menu    "
+                } else {
+                    " stop, back to files    "
+                }),
                 key_name("q"),
                 Span::raw(" stop and quit"),
             ]),
@@ -459,6 +495,15 @@ fn draw_keys(frame: &mut Frame, app: &App, area: Rect) {
                 key_name("q"),
                 Span::raw(" stop and quit"),
             ]),
+        ],
+        Screen::Mode => vec![
+            Line::from(Span::styled(
+                help_text(Screen::Mode),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from("Mirror this PC on the TV, or pick a movie file."),
         ],
         Screen::Pin => vec![
             Line::from(Span::styled(

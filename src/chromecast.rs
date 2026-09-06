@@ -140,6 +140,61 @@ pub async fn start_cast(
     ))
 }
 
+pub async fn start_cast_desktop(
+    ip: &str,
+    port: u16,
+    media_port: u16,
+) -> Result<(CastSession, f64), String> {
+    let slug = uuid::Uuid::new_v4().simple().to_string();
+    let dummy = crate::capture::desktop_path();
+    let server = bind_on_open_port(
+        dummy,
+        media_port,
+        ip,
+        &slug,
+        CastSource::Desktop,
+        0.0,
+    )
+    .await?;
+    let url = server.content_location();
+    crate::airplay::debug_log(&format!(
+        "chromecast LOAD desktop {url} LIVE -> {ip}:{port}"
+    ));
+
+    let mut conn = CastConn::connect(ip, port).await?;
+    if let Err(err) = conn
+        .launch_and_load(&url, "video/mp4", "LIVE", 0.0)
+        .await
+    {
+        drop(server);
+        return Err(err);
+    }
+
+    let finished = Arc::new(AtomicBool::new(false));
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let flag = finished.clone();
+    tokio::spawn(async move {
+        conn.pump_until_idle(stop_rx).await;
+        flag.store(true, Ordering::Relaxed);
+    });
+
+    if !wait_for_remote_get(&server, Duration::from_secs(15)).await {
+        let _ = stop_tx.send(());
+        drop(server);
+        return Err("Chromecast did not fetch the desktop stream.".to_string());
+    }
+
+    Ok((
+        CastSession {
+            stop: Some(stop_tx),
+            finished,
+            server: Some(server),
+            tmp: None,
+        },
+        0.0,
+    ))
+}
+
 async fn bind_on_open_port(
     path: PathBuf,
     requested: u16,
@@ -172,6 +227,7 @@ async fn bind_on_open_port(
                 MediaServer::start_live_unique(path.clone(), port, slug.to_string(), false, start)
                     .await
             }
+            CastSource::Desktop => MediaServer::start_desktop_unique(port, slug.to_string()).await,
         };
         match started {
             Ok(server) => {
@@ -307,6 +363,7 @@ enum CastSource {
     File,
     LiveCopyVideo,
     LiveTranscode,
+    Desktop,
 }
 
 async fn decide_cast_source(path: &Path) -> CastSource {

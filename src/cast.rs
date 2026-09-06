@@ -133,17 +133,28 @@ impl CastConn {
             &json!({"type":"GET_STATUS","requestId": id}),
         )
         .await?;
-        self.wait_transport(Duration::from_secs(4)).await.ok();
-        if self.transport_id.is_none() {
-            let id = self.next_id();
-            self.send(
-                RECEIVER,
-                NS_RECV,
-                &json!({"type":"LAUNCH","appId": DEFAULT_APP,"requestId": id}),
-            )
-            .await?;
-            self.wait_transport(Duration::from_secs(12)).await?;
-        }
+        self.wait_transport(Duration::from_secs(3)).await.ok();
+
+        // Always quit the current app. A failed desktop/HLS LOAD leaves the
+        // default receiver running but deaf — later movie LOADs never GET.
+        let id = self.next_id();
+        let _ = self
+            .send(RECEIVER, NS_RECV, &json!({"type":"STOP","requestId": id}))
+            .await;
+        self.transport_id = None;
+        self.media_session_id = None;
+        self.drain_for(Duration::from_millis(400)).await;
+        self.transport_id = None;
+        self.media_session_id = None;
+
+        let id = self.next_id();
+        self.send(
+            RECEIVER,
+            NS_RECV,
+            &json!({"type":"LAUNCH","appId": DEFAULT_APP,"requestId": id}),
+        )
+        .await?;
+        self.wait_transport(Duration::from_secs(12)).await?;
         let transport = self
             .transport_id
             .clone()
@@ -151,14 +162,6 @@ impl CastConn {
         self.send(&transport, NS_CONN, &json!({"type":"CONNECT"}))
             .await?;
         self.set_volume(CAST_VOLUME).await?;
-        let id = self.next_id();
-        let _ = self
-            .send(
-                &transport,
-                NS_MEDIA,
-                &json!({"type":"STOP","requestId": id}),
-            )
-            .await;
         let id = self.next_id();
         let load = json!({
             "type": "LOAD",
@@ -175,6 +178,19 @@ impl CastConn {
         let started = self.wait_media_started(Duration::from_secs(15)).await;
         let _ = self.set_volume(CAST_VOLUME).await;
         started
+    }
+
+    async fn drain_for(&mut self, dur: Duration) {
+        let deadline = tokio::time::Instant::now() + dur;
+        while tokio::time::Instant::now() < deadline {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(left, self.recv()).await {
+                Ok(Ok(msg)) => {
+                    let _ = self.handle_incoming(msg);
+                }
+                _ => return,
+            }
+        }
     }
 
     async fn set_volume(&mut self, level: f64) -> Result<(), String> {

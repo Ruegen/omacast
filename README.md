@@ -4,7 +4,7 @@
   <img src="preview.png" alt="Omacast" />
 </p>
 
-Send a local video file to an AirPlay TV. No local player, no desktop mirror — the file plays on the TV.
+Send a local video file to an AirPlay TV or Chromecast, or mirror this screen. No local movie player.
 
 Video only for now. Omacast does not change the TV volume (it never sets 100%).
 
@@ -24,7 +24,7 @@ cp packaging/Omacast.desktop ~/.local/share/applications/
 source = ~/apps/omacast/packaging/hyprland-omacast.conf
 ```
 
-Super+Space, Omacast. Pick the TV, PIN once, pick a file — it plays on the TV. Esc stops.
+Super+Space, Omacast. Pick the TV, PIN once, then choose **mirror this screen** or **play a video**. Esc stops.
 
 Headless: `omacast --play FILE --host IP`
 
@@ -66,6 +66,8 @@ Chromecast reuses a TCP port UFW already allows (often LocalSend **53317**). No 
 Every screen shows a keys panel.
 
 **Discovery** `↑↓ select  Enter TV (pair)  r refresh  q quit`
+
+**Mode** `↑↓ select  Enter  Esc back` — mirror this screen, or play a video
 
 **Files** `↑↓ select  type to search  Enter play  a add folder  d remove folder  Esc back`
 

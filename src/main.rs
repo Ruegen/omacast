@@ -3,6 +3,7 @@ mod airplay;
 mod app;
 mod audio;
 mod bplist;
+mod capture;
 mod cast;
 mod chromecast;
 mod config;

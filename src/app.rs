@@ -1,4 +1,4 @@
-//! TUI state machine: discovery (pair) → files → pin → control.
+//! TUI state machine: discovery (pair) → mode → files → pin → control.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -31,6 +31,7 @@ pub enum Error {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Discovery,
+    Mode,
     Files,
     AddFolder,
     Pin,
@@ -142,6 +143,8 @@ pub struct App {
     pub playback_info_ok: bool,
     pub last_error: Option<String>,
     pub screen_cast: bool,
+    pub mirroring: bool,
+    pub selected_mode: usize,
 
     pub pin_buf: String,
     pair_setup: Option<PairSetupSession>,
@@ -202,6 +205,8 @@ impl App {
             playback_info_ok: false,
             last_error: None,
             screen_cast: false,
+            mirroring: false,
+            selected_mode: 1,
             pin_buf: String::new(),
             pair_setup: None,
             pending_location: None,
@@ -330,6 +335,7 @@ impl App {
         }
         match self.screen {
             Screen::Discovery => self.handle_discovery_key(key),
+            Screen::Mode => self.handle_mode_key(key),
             Screen::Files => self.handle_files_key(key),
             Screen::AddFolder => self.handle_add_folder_key(key),
             Screen::Pin => self.handle_pin_key(key),
@@ -374,8 +380,7 @@ impl App {
         self.pending_location = None;
         self.last_error = None;
         if device.is_chromecast() {
-            self.show_files();
-            self.status = format!("{} — Chromecast, pick a file", device.name);
+            self.show_mode();
             return;
         }
         let device_id = self.device_id.clone();
@@ -383,6 +388,50 @@ impl App {
         self.spawn_net(BusyKind::Connecting, async move {
             job_select_tv(device, device_id, creds).await
         });
+    }
+
+    fn show_mode(&mut self) {
+        self.mirroring = false;
+        self.selected_mode = 1;
+        self.screen = Screen::Mode;
+        let name = self
+            .device
+            .as_ref()
+            .map(|d| d.name.as_str())
+            .unwrap_or("TV");
+        self.status = format!("{name} — mirror this screen, or play a video");
+    }
+
+    fn leave_device(&mut self) {
+        self.airplay = None;
+        self.play_ok = false;
+        self.session_paired = false;
+        self.mirroring = false;
+        self.teardown_server();
+        self.pending_location = None;
+        self.device = None;
+        self.screen = Screen::Discovery;
+        self.status = if self.devices.is_empty() {
+            "No receivers found. Press r to refresh.".to_string()
+        } else {
+            receiver_status(self.devices.len())
+        };
+    }
+
+    fn handle_mode_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => self.leave_device(),
+            KeyCode::Up | KeyCode::Char('k') => self.selected_mode = 0,
+            KeyCode::Down | KeyCode::Char('j') => self.selected_mode = 1,
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if self.selected_mode == 0 {
+                    self.queue_start_mirror();
+                } else {
+                    self.show_files();
+                }
+            }
+            _ => {}
+        }
     }
 
     fn show_files(&mut self) {
@@ -407,20 +456,7 @@ impl App {
 
     fn handle_files_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => {
-                self.airplay = None;
-                self.play_ok = false;
-                self.session_paired = false;
-                self.teardown_server();
-                self.pending_location = None;
-                self.device = None;
-                self.screen = Screen::Discovery;
-                self.status = if self.devices.is_empty() {
-                    "No receivers found. Press r to refresh.".to_string()
-                } else {
-                    receiver_status(self.devices.len())
-                };
-            }
+            KeyCode::Esc => self.show_mode(),
             KeyCode::Up => {
                 if self.selected_file > 0 {
                     self.selected_file -= 1;
@@ -652,6 +688,22 @@ impl App {
         }
     }
 
+    fn queue_start_mirror(&mut self) {
+        if !crate::capture::tools_available() {
+            self.status =
+                "Need gpu-screen-recorder and ffmpeg to mirror this screen.".to_string();
+            return;
+        }
+        self.mirroring = true;
+        self.queue_play_file(
+            MediaFile {
+                path: crate::capture::desktop_path(),
+                root: PathBuf::from("/"),
+            },
+            0.0,
+        );
+    }
+
     fn queue_start_playback(&mut self, start: f64) {
         let Some(&idx) = self.filtered.get(self.selected_file) else {
             return;
@@ -659,6 +711,11 @@ impl App {
         let Some(file) = self.files.get(idx).cloned() else {
             return;
         };
+        self.mirroring = false;
+        self.queue_play_file(file, start);
+    }
+
+    fn queue_play_file(&mut self, file: MediaFile, start: f64) {
         let Some(device) = self.device.clone() else {
             return;
         };
@@ -795,7 +852,7 @@ impl App {
 
     pub fn show_net_panel(&self) -> bool {
         match self.screen {
-            Screen::Files | Screen::Pin | Screen::Control => true,
+            Screen::Files | Screen::Mode | Screen::Pin | Screen::Control => true,
             Screen::Discovery => self.busy.is_some() || self.device.is_some(),
             Screen::AddFolder | Screen::Resume => false,
         }
@@ -879,13 +936,13 @@ impl App {
                 self.airplay = Some(client);
                 self.session_paired = true;
                 self.pin_from_discovery = false;
-                self.show_files();
+                self.show_mode();
                 let name = self
                     .device
                     .as_ref()
                     .map(|d| d.name.as_str())
                     .unwrap_or("TV");
-                self.status = format!("{name} — paired, pick a file");
+                self.status = format!("{name} — paired, mirror this screen or play a video");
             }
             NetResult::NeedPin {
                 client,
@@ -938,13 +995,13 @@ impl App {
                     self.queue_retry_play();
                 } else {
                     self.pin_from_discovery = false;
-                    self.show_files();
+                    self.show_mode();
                     let name = self
                         .device
                         .as_ref()
                         .map(|d| d.name.as_str())
                         .unwrap_or("TV");
-                    self.status = format!("{name} — paired, pick a file");
+                    self.status = format!("{name} — paired, mirror this screen or play a video");
                 }
             }
             NetResult::PinRetry { client, err, setup } => {
@@ -1054,7 +1111,12 @@ impl App {
         }
         self.teardown_server();
         self.pending_location = None;
-        self.screen = Screen::Files;
+        self.screen = if self.mirroring {
+            self.mirroring = false;
+            Screen::Mode
+        } else {
+            Screen::Files
+        };
     }
 
     fn pairing_gave_up(&mut self) {
@@ -1072,7 +1134,7 @@ impl App {
             self.pin_from_discovery = false;
             self.screen = Screen::Discovery;
         } else {
-            self.screen = Screen::Files;
+            self.screen = Screen::Mode;
         }
     }
 
@@ -1210,6 +1272,9 @@ impl App {
         let Some(path) = self.current_file.as_ref() else {
             return;
         };
+        if crate::capture::is_desktop(path) || self.mirroring {
+            return;
+        }
         if !self.play_ok {
             return;
         }
@@ -1226,16 +1291,23 @@ impl App {
         self.screen_cast = false;
         self.pair_setup = None;
         self.pending_location = None;
-        self.screen = Screen::Files;
+        self.screen = if self.mirroring {
+            Screen::Mode
+        } else {
+            Screen::Files
+        };
+        self.mirroring = false;
         self.status = "Stopped".to_string();
     }
 
     async fn screen_cast_finished(&mut self) {
         if let Some(path) = self.current_file.as_ref() {
-            if crate::resume::should_offer(self.position, self.duration) {
-                crate::resume::save(path, self.position, self.duration);
-            } else {
-                crate::resume::clear(path);
+            if !crate::capture::is_desktop(path) {
+                if crate::resume::should_offer(self.position, self.duration) {
+                    crate::resume::save(path, self.position, self.duration);
+                } else {
+                    crate::resume::clear(path);
+                }
             }
         }
         self.send_stop().await;
@@ -1246,7 +1318,12 @@ impl App {
         self.screen_cast = false;
         self.pair_setup = None;
         self.pending_location = None;
-        self.screen = Screen::Files;
+        self.screen = if self.mirroring {
+            Screen::Mode
+        } else {
+            Screen::Files
+        };
+        self.mirroring = false;
         self.status = "Done".to_string();
     }
 
@@ -1489,7 +1566,11 @@ async fn job_play_chromecast(
     start: f64,
 ) -> NetResult {
     let ip = device.preferred_host();
-    match crate::chromecast::start_cast(&ip, device.port, &file.path, media_port, start).await {
+    match if crate::capture::is_desktop(&file.path) {
+        crate::chromecast::start_cast_desktop(&ip, device.port, media_port).await
+    } else {
+        crate::chromecast::start_cast(&ip, device.port, &file.path, media_port, start).await
+    } {
         Ok((session, duration)) => NetResult::CastOk { session, duration },
         Err(err) => NetResult::PlayFail {
             client: None,
@@ -1515,8 +1596,26 @@ async fn job_play(
         }
     }
     let screen = crate::airplay::is_screen_mirroring_tv(&device);
+    let desktop = crate::capture::is_desktop(&file.path);
     let mut server = None;
-    let location = if screen {
+    let location = if desktop && screen {
+        "file://desktop".to_string()
+    } else if desktop {
+        let slug = uuid::Uuid::new_v4().simple().to_string();
+        match MediaServer::start_desktop_unique(media_port, slug).await {
+            Ok(s) => {
+                let loc = s.content_location();
+                server = Some(s);
+                loc
+            }
+            Err(err) => {
+                return NetResult::PlayFail {
+                    client,
+                    err: format!("desktop stream: {err}"),
+                };
+            }
+        }
+    } else if screen {
         format!("file://{}", file.path.to_string_lossy())
     } else {
         let hls = crate::airplay::device_wants_hls(&device);
@@ -1564,10 +1663,15 @@ async fn job_play(
             client.set_hls(dir, s.origin());
         }
     }
+    let local_file = if desktop && !screen {
+        None
+    } else {
+        Some(file.path.as_path())
+    };
     // Handshake only. play() returns once a type-110 stream is rolling.
     match tokio::time::timeout(
         Duration::from_secs(75),
-        client.play(&location, start, Some(file.path.as_path())),
+        client.play(&location, start, local_file),
     )
     .await
     {
@@ -1649,6 +1753,7 @@ pub fn help_text(screen: Screen) -> &'static str {
 pub fn help_text_cast(screen: Screen, screen_cast: bool) -> &'static str {
     match screen {
         Screen::Discovery => "↑↓ select  Enter  r refresh  q quit",
+        Screen::Mode => "↑↓ select  Enter  Esc back",
         Screen::Files => {
             "↑↓ select  type to search  Enter play  a add folder  d remove folder  Esc back"
         }
@@ -1703,5 +1808,8 @@ mod tests {
             !f.contains("pair"),
             "files help must not mention pairing: {f}"
         );
+        let m = help_text(Screen::Mode).to_ascii_lowercase();
+        assert!(m.contains("enter"), "mode help should mention Enter: {m}");
+        assert!(m.contains("esc"), "mode help should mention Esc: {m}");
     }
 }

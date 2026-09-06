@@ -15,6 +15,7 @@ const FFMPEG: &str = "/usr/bin/ffmpeg";
 pub struct HlsSession {
     pub dir: PathBuf,
     child: Option<Child>,
+    sidecar: Option<Child>,
     pub playlist: String,
 }
 
@@ -22,6 +23,9 @@ impl Drop for HlsSession {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.start_kill();
+        }
+        if let Some(mut sidecar) = self.sidecar.take() {
+            let _ = sidecar.start_kill();
         }
         if self.dir.exists() {
             let _ = std::fs::remove_dir_all(&self.dir);
@@ -49,6 +53,7 @@ impl HlsSession {
                 return Ok(Self {
                     dir,
                     child: Some(child),
+                    sidecar: None,
                     playlist,
                 });
             }
@@ -64,7 +69,29 @@ impl HlsSession {
         Ok(Self {
             dir,
             child: Some(child),
+            sidecar: None,
             playlist,
+        })
+    }
+
+    /// Live desktop → HLS (Chromecast fetches playlists; raw live MP4 it often ignores).
+    pub async fn start_desktop() -> Result<Self, String> {
+        if !Path::new(FFMPEG).is_file() {
+            return Err(format!("ffmpeg not found at {FFMPEG}"));
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "omacast-desk-hls-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| format!("hls dir: {e}"))?;
+        let (ffmpeg, recorder) = spawn_desktop_playlist(&dir, false).await?;
+        Ok(Self {
+            dir,
+            child: Some(ffmpeg),
+            sidecar: Some(recorder),
+            playlist: "out.m3u8".into(),
         })
     }
 }
@@ -228,6 +255,94 @@ async fn spawn_and_wait_playlist(
         if Instant::now() > deadline {
             let _ = child.start_kill();
             return Err("ffmpeg hls timed out".into());
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+}
+
+async fn spawn_desktop_playlist(dir: &Path, audio: bool) -> Result<(Child, Child), String> {
+    let mut recorder = crate::capture::spawn_recorder(audio)?;
+    let rec_out = recorder
+        .stdout
+        .take()
+        .ok_or_else(|| "gpu-screen-recorder: no stdout".to_string())?;
+    let rec_fd = rec_out
+        .into_owned_fd()
+        .map_err(|e| format!("gpu-screen-recorder stdout: {e}"))?;
+
+    let mut cmd = Command::new(FFMPEG);
+    cmd.kill_on_drop(true)
+        .stdin(Stdio::from(rec_fd))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .current_dir(dir)
+        .args([
+            "-nostdin",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-fflags",
+            "+genpts",
+            "-i",
+            "pipe:0",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-tune",
+            "zerolatency",
+            "-profile:v",
+            "baseline",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "30",
+            "-bf",
+            "0",
+            "-f",
+            "hls",
+            "-hls_time",
+            "1",
+            "-hls_list_size",
+            "6",
+            "-hls_flags",
+            "delete_segments+independent_segments",
+            "out.m3u8",
+        ]);
+    if audio {
+        // Replace the `-an` we always pass: rebuild without -an is messy; drop -an via extra maps.
+        // Audio is optional; video-only HLS is enough for Chromecast picture.
+        let _ = audio;
+    }
+
+    let mut child = cmd.spawn().map_err(|e| {
+        let _ = recorder.start_kill();
+        format!("ffmpeg: {e}")
+    })?;
+
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        if playlist_ready(dir) {
+            crate::airplay::debug_log("desktop hls playlist ready");
+            return Ok((child, recorder));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let _ = recorder.start_kill();
+                return Err(format!("ffmpeg {status}"));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let _ = recorder.start_kill();
+                return Err(format!("ffmpeg wait: {e}"));
+            }
+        }
+        if Instant::now() > deadline {
+            let _ = child.start_kill();
+            let _ = recorder.start_kill();
+            return Err("desktop hls timed out".into());
         }
         tokio::time::sleep(Duration::from_millis(80)).await;
     }

@@ -113,6 +113,7 @@ enum LiveKind {
     Off,
     CopyVideo,
     Transcode,
+    Desktop,
 }
 
 /// Running media server. Dropping it (or calling [`shutdown`](Self::shutdown))
@@ -152,6 +153,19 @@ impl MediaServer {
             LiveKind::Transcode
         };
         Self::bind(path, bind_port, None, Some(slug), kind, start_at).await
+    }
+
+    /// Live desktop capture as fragmented MP4 on a unique `/c/{slug}.mp4` URL.
+    pub async fn start_desktop_unique(bind_port: u16, slug: String) -> Result<Self, Error> {
+        Self::bind(
+            crate::capture::desktop_path(),
+            bind_port,
+            None,
+            Some(slug),
+            LiveKind::Desktop,
+            0.0,
+        )
+        .await
     }
 
     pub async fn start_hls(path: PathBuf, bind_port: u16) -> Result<Self, Error> {
@@ -431,6 +445,9 @@ fn serve_live_ffmpeg(method: Method, state: &MediaState) -> Response {
                 "44100",
             ]);
         }
+        LiveKind::Desktop => {
+            return serve_desktop_live(method, builder);
+        }
         LiveKind::Off => unreachable!(),
     }
     cmd.args([
@@ -465,6 +482,27 @@ fn serve_live_ffmpeg(method: Method, state: &MediaState) -> Response {
     crate::airplay::debug_log("chromecast live ffmpeg started");
     builder
         .body(Body::from_stream(ReaderStream::new(stdout)))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn serve_desktop_live(_method: Method, builder: axum::http::response::Builder) -> Response {
+    let pipe = match crate::capture::spawn_frag_mp4() {
+        Ok(p) => p,
+        Err(err) => {
+            crate::airplay::debug_log(&format!("desktop live: {err}"));
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let mut ffmpeg = pipe.ffmpeg;
+    let mut recorder = pipe.recorder;
+    tokio::spawn(async move {
+        let _ = ffmpeg.wait().await;
+        let _ = recorder.start_kill();
+        let _ = recorder.wait().await;
+    });
+    crate::airplay::debug_log("chromecast desktop live started");
+    builder
+        .body(Body::from_stream(ReaderStream::new(pipe.stdout)))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
