@@ -103,3 +103,120 @@ pub fn persist_folders(folders: &[PathBuf]) -> io::Result<()> {
         folders: folders.to_vec(),
     })
 }
+
+/// Directory matches for Tab-complete. Paths keep a `~/` prefix when the user typed `~`.
+pub fn list_folder_matches(input: &str) -> Vec<String> {
+    if input == "~" {
+        return vec!["~/".to_string()];
+    }
+    let Some((disp_parent, name_prefix, fs_parent)) = completion_parts(input) else {
+        return Vec::new();
+    };
+    let Ok(rd) = fs::read_dir(&fs_parent) else {
+        return Vec::new();
+    };
+    let hide_dot = !name_prefix.starts_with('.');
+    let mut out = Vec::new();
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if hide_dot && name.starts_with('.') {
+            continue;
+        }
+        if !name.starts_with(&name_prefix) {
+            continue;
+        }
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false) || entry.path().is_dir();
+        if !is_dir {
+            continue;
+        }
+        out.push(join_displayed(&disp_parent, name));
+    }
+    out.sort();
+    out
+}
+
+/// Longest shared prefix of match strings (bytes/chars as `str` prefixes).
+pub fn common_folder_prefix(matches: &[String]) -> String {
+    let Some(first) = matches.first() else {
+        return String::new();
+    };
+    let mut prefix = first.as_str();
+    for m in matches.iter().skip(1) {
+        let n = prefix
+            .chars()
+            .zip(m.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        prefix = &prefix[..prefix.char_indices().nth(n).map(|(i, _)| i).unwrap_or(prefix.len())];
+        if prefix.is_empty() {
+            break;
+        }
+    }
+    prefix.to_string()
+}
+
+fn completion_parts(input: &str) -> Option<(String, String, PathBuf)> {
+    if input.is_empty() {
+        let home = expand_path("~");
+        if home.as_os_str().is_empty() {
+            return None;
+        }
+        return Some(("~".into(), String::new(), home));
+    }
+    if input.ends_with('/') {
+        let fs = expand_path(input);
+        let disp = if input.starts_with('/') && input.chars().all(|c| c == '/') {
+            "/".to_string()
+        } else {
+            input.trim_end_matches('/').to_string()
+        };
+        return Some((disp, String::new(), fs));
+    }
+    if let Some((parent, name)) = input.rsplit_once('/') {
+        let fs_parent = if parent.is_empty() {
+            PathBuf::from("/")
+        } else {
+            expand_path(parent)
+        };
+        let disp_parent = parent.to_string();
+        return Some((disp_parent, name.to_string(), fs_parent));
+    }
+    let cwd = std::env::current_dir().ok()?;
+    Some((String::new(), input.to_string(), cwd))
+}
+
+fn join_displayed(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        format!("{name}/")
+    } else if parent == "/" {
+        format!("/{name}/")
+    } else {
+        format!("{parent}/{name}/")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{common_folder_prefix, join_displayed};
+
+    #[test]
+    fn common_prefix_extends_shared_stem() {
+        let m = vec![
+            "~/Videos/".to_string(),
+            "~/VirtualBox/".to_string(),
+        ];
+        assert_eq!(common_folder_prefix(&m), "~/Vi");
+        assert_eq!(common_folder_prefix(&["~/Videos/".into()]), "~/Videos/");
+        assert_eq!(common_folder_prefix(&[]), "");
+    }
+
+    #[test]
+    fn join_keeps_tilde_and_root() {
+        assert_eq!(join_displayed("~", "Videos"), "~/Videos/");
+        assert_eq!(join_displayed("", "Videos"), "Videos/");
+        assert_eq!(join_displayed("/", "home"), "/home/");
+    }
+}

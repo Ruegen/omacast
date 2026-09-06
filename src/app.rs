@@ -131,6 +131,8 @@ pub struct App {
     pub scanning: bool,
     scan_rx: Option<oneshot::Receiver<Vec<MediaFile>>>,
     pub folder_input: String,
+    folder_completions: Vec<String>,
+    folder_complete_idx: Option<usize>,
 
     pub device: Option<AirPlayDevice>,
     pub current_file: Option<PathBuf>,
@@ -190,6 +192,8 @@ impl App {
             scanning: false,
             scan_rx: None,
             folder_input: String::new(),
+            folder_completions: Vec::new(),
+            folder_complete_idx: None,
             device: None,
             current_file: None,
             playing: false,
@@ -430,8 +434,10 @@ impl App {
             KeyCode::Enter => self.offer_or_start_playback(),
             KeyCode::Char('a') => {
                 self.folder_input.clear();
+                self.folder_completions.clear();
+                self.folder_complete_idx = None;
                 self.screen = Screen::AddFolder;
-                self.status = "Type a folder path, then Enter. ~ is expanded.".to_string();
+                self.status = "Type a folder path. Tab completes. ~ is expanded.".to_string();
             }
             KeyCode::Char('d') => self.remove_selected_folder(),
             KeyCode::Backspace => {
@@ -452,9 +458,12 @@ impl App {
     fn handle_add_folder_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
+                self.folder_completions.clear();
+                self.folder_complete_idx = None;
                 self.screen = Screen::Files;
                 self.status_files();
             }
+            KeyCode::Tab | KeyCode::Char('\t') => self.apply_folder_complete(),
             KeyCode::Enter => {
                 let path = config::expand_path(&self.folder_input);
                 if path.as_os_str().is_empty() {
@@ -477,14 +486,52 @@ impl App {
             }
             KeyCode::Backspace => {
                 self.folder_input.pop();
+                self.folder_complete_idx = None;
             }
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
                 self.folder_input.push(c);
+                self.folder_complete_idx = None;
             }
             _ => {}
+        }
+    }
+
+    fn refresh_folder_completions(&mut self) {
+        self.folder_completions = config::list_folder_matches(&self.folder_input);
+    }
+
+    fn apply_folder_complete(&mut self) {
+        self.refresh_folder_completions();
+        match self.folder_completions.len() {
+            0 => {
+                self.status = "No matching folder.".to_string();
+            }
+            1 => {
+                self.folder_input = self.folder_completions[0].clone();
+                self.folder_complete_idx = Some(0);
+                self.refresh_folder_completions();
+                self.status = "Tab complete".to_string();
+            }
+            n => {
+                let common = config::common_folder_prefix(&self.folder_completions);
+                if common.len() > self.folder_input.len() {
+                    self.folder_input = common;
+                    self.folder_complete_idx = None;
+                    self.refresh_folder_completions();
+                    self.status = format!("{n} matches, Tab again to cycle");
+                } else {
+                    let i = self
+                        .folder_complete_idx
+                        .map(|i| (i + 1) % n)
+                        .unwrap_or(0);
+                    self.folder_input = self.folder_completions[i].clone();
+                    self.folder_complete_idx = Some(i);
+                    self.status = format!("match {}/{n}", i + 1);
+                }
+            }
         }
     }
 
@@ -1605,7 +1652,7 @@ pub fn help_text_cast(screen: Screen, screen_cast: bool) -> &'static str {
         Screen::Files => {
             "↑↓ select  type to search  Enter play  a add folder  d remove folder  Esc back"
         }
-        Screen::AddFolder => "type path  Enter save  Esc cancel  ~ expands",
+        Screen::AddFolder => "type path  Tab complete  Enter save  Esc cancel  ~ expands",
         Screen::Pin => "0–9 enter code  Enter confirm  Esc cancel",
         Screen::Resume => "Enter resume  n start over  Esc back",
         Screen::Control if screen_cast => "Esc stop  q quit",
