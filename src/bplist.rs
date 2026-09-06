@@ -502,6 +502,57 @@ pub fn encode_setup_screen_ios_fp(
     )
 }
 
+/// Type 110 + type 100 MainAudio in one SETUP so the TV can return both dataPorts.
+pub fn encode_setup_screen_and_main_audio(
+    stream_connection_id: u64,
+    uuid: &str,
+    ekey: Option<&[u8]>,
+    eiv: Option<&[u8]>,
+    timing_port: u16,
+    control_port: u16,
+    shk: &[u8; 32],
+) -> Vec<u8> {
+    let id = stream_connection_id_i64(stream_connection_id);
+    let mut screen = vec![
+        ("type".into(), PlistValue::Integer(110)),
+        ("streamConnectionID".into(), PlistValue::Integer(id)),
+        ("timestampInfo".into(), timestamp_info_array()),
+        ("latencyMs".into(), PlistValue::Integer(90)),
+        ("fps".into(), PlistValue::Integer(30)),
+        ("usingScreen".into(), PlistValue::Boolean(true)),
+        (
+            "supportsHighAccuracyTimestamps".into(),
+            PlistValue::Boolean(true),
+        ),
+        ("uuid".into(), PlistValue::String(uuid.into())),
+        ("timingPort".into(), PlistValue::Integer(i64::from(timing_port))),
+        ("controlPort".into(), PlistValue::Integer(i64::from(control_port))),
+    ];
+    if let Some(key) = ekey {
+        screen.push(("ekey".into(), PlistValue::Data(key.to_vec())));
+        screen.push(("et".into(), PlistValue::Integer(32)));
+    }
+    if let Some(iv) = eiv {
+        screen.push(("eiv".into(), PlistValue::Data(iv.to_vec())));
+    }
+    let audio = vec![
+        ("type".into(), PlistValue::Integer(100)),
+        ("audioFormat".into(), PlistValue::Integer(0x40_0000)),
+        ("audioMode".into(), PlistValue::String("default".into())),
+        ("audioType".into(), PlistValue::String("default".into())),
+        ("ct".into(), PlistValue::Integer(4)),
+        ("spf".into(), PlistValue::Integer(1024)),
+        ("latencyMin".into(), PlistValue::Integer(11_025)),
+        ("latencyMax".into(), PlistValue::Integer(88_200)),
+        ("shk".into(), PlistValue::Data(shk.to_vec())),
+        ("controlPort".into(), PlistValue::Integer(i64::from(control_port))),
+    ];
+    to_binary(&PlistValue::Dict(vec![(
+        "streams".into(),
+        PlistValue::Array(vec![PlistValue::Dict(screen), PlistValue::Dict(audio)]),
+    )]))
+}
+
 /// SETUP-response key list (no data blobs / secrets).
 pub fn setup_response_keys(bytes: &[u8]) -> String {
     match from_binary(bytes) {
@@ -581,9 +632,83 @@ fn encode_setup_screen_body_full(
     )]))
 }
 
+/// Screen-mirror audio as captured from Mac/iOS: type 96 ALAC, no `shk`.
+/// `audioFormat` 0x40000, `ct` 2, `spf` 352.
+pub fn encode_setup_audio_96(control_port: Option<u16>) -> Vec<u8> {
+    let mut stream = vec![
+        ("type".into(), PlistValue::Integer(96)),
+        ("audioFormat".into(), PlistValue::Integer(0x4_0000)),
+        ("audioMode".into(), PlistValue::String("default".into())),
+        ("ct".into(), PlistValue::Integer(2)),
+        ("spf".into(), PlistValue::Integer(352)),
+        ("latencyMin".into(), PlistValue::Integer(11_025)),
+        ("latencyMax".into(), PlistValue::Integer(88_200)),
+    ];
+    if let Some(port) = control_port {
+        stream.push(("controlPort".into(), PlistValue::Integer(i64::from(port))));
+    }
+    to_binary(&PlistValue::Dict(vec![(
+        "streams".into(),
+        PlistValue::Array(vec![PlistValue::Dict(stream)]),
+    )]))
+}
+
 /// `dataPort` from a screen-stream SETUP response (`streams[0].dataPort`).
 /// Extra keys on the root or stream dict are ignored.
 pub fn data_port_from_setup(bytes: &[u8]) -> Option<u16> {
+    data_port_for_type(bytes, None).or_else(|| stream_port_from_setup(bytes, "dataPort"))
+}
+
+/// `dataPort` on the first stream whose `type` matches, or any `dataPort` if `ty` is None.
+pub fn data_port_for_type(bytes: &[u8], ty: Option<i64>) -> Option<u16> {
+    let root = from_binary(bytes).ok()?;
+    let PlistValue::Dict(pairs) = root else {
+        return None;
+    };
+    for (k, v) in &pairs {
+        if k == "dataPort" && ty.is_none() {
+            if let Some(p) = port_from_value(v) {
+                return Some(p);
+            }
+        }
+        if k != "streams" {
+            continue;
+        }
+        let PlistValue::Array(items) = v else {
+            continue;
+        };
+        for item in items {
+            let PlistValue::Dict(stream) = item else {
+                continue;
+            };
+            let mut got_ty = None;
+            let mut port = None;
+            for (sk, sv) in stream {
+                if sk == "type" {
+                    if let PlistValue::Integer(n) = sv {
+                        got_ty = Some(*n);
+                    }
+                }
+                if sk == "dataPort" {
+                    port = port_from_value(sv);
+                }
+            }
+            match (ty, got_ty, port) {
+                (Some(want), Some(got), Some(p)) if got == want => return Some(p),
+                (None, _, Some(p)) => return Some(p),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// `controlPort` from a stream SETUP response (`streams[0].controlPort`).
+pub fn control_port_from_setup(bytes: &[u8]) -> Option<u16> {
+    stream_port_from_setup(bytes, "controlPort")
+}
+
+fn stream_port_from_setup(bytes: &[u8], key: &str) -> Option<u16> {
     let root = from_binary(bytes).ok()?;
     let PlistValue::Dict(pairs) = root else {
         return None;
@@ -600,11 +725,10 @@ pub fn data_port_from_setup(bytes: &[u8]) -> Option<u16> {
                 continue;
             };
             for (sk, sv) in stream {
-                if sk == "dataPort" {
+                if sk == key {
                     return port_from_value(sv);
                 }
             }
-            // First dict had no usable dataPort.
             return None;
         }
         return None;
@@ -1561,5 +1685,91 @@ mod tests {
             Some(PlistValue::Integer(n)) => assert_ne!(*n, 0),
             other => panic!("expected nonzero integer, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn audio_96_plist_roundtrips_format_and_shk() {
+        let bytes = encode_setup_audio_96(Some(60003));
+        assert!(bytes.starts_with(b"bplist00"));
+        let root = from_binary(&bytes).expect("decode audio setup");
+        let PlistValue::Dict(pairs) = root else {
+            panic!("not a dict");
+        };
+        let Some(PlistValue::Array(items)) = dict_get(&pairs, "streams") else {
+            panic!("streams is not an array");
+        };
+        let PlistValue::Dict(stream) = &items[0] else {
+            panic!("stream is not a dict");
+        };
+        assert_eq!(dict_get(stream, "type"), Some(&PlistValue::Integer(96)));
+        assert_eq!(
+            dict_get(stream, "audioFormat"),
+            Some(&PlistValue::Integer(0x4_0000))
+        );
+        assert_eq!(dict_get(stream, "ct"), Some(&PlistValue::Integer(2)));
+        assert_eq!(dict_get(stream, "spf"), Some(&PlistValue::Integer(352)));
+        assert_eq!(
+            dict_get(stream, "controlPort"),
+            Some(&PlistValue::Integer(60003))
+        );
+        assert!(dict_get(stream, "shk").is_none());
+        assert!(dict_get(stream, "usingScreen").is_none());
+    }
+
+    #[test]
+    fn screen_and_main_audio_has_110_and_100() {
+        let shk = [0x22u8; 32];
+        let bytes = encode_setup_screen_and_main_audio(99, "u", None, None, 60000, 60001, &shk);
+        let root = from_binary(&bytes).expect("decode");
+        let PlistValue::Dict(pairs) = root else {
+            panic!("not a dict");
+        };
+        let Some(PlistValue::Array(items)) = dict_get(&pairs, "streams") else {
+            panic!("streams");
+        };
+        assert_eq!(items.len(), 2);
+        let PlistValue::Dict(s0) = &items[0] else {
+            panic!("s0");
+        };
+        let PlistValue::Dict(s1) = &items[1] else {
+            panic!("s1");
+        };
+        assert_eq!(dict_get(s0, "type"), Some(&PlistValue::Integer(110)));
+        assert_eq!(dict_get(s1, "type"), Some(&PlistValue::Integer(100)));
+        match dict_get(s1, "shk") {
+            Some(PlistValue::Data(d)) => assert_eq!(d.len(), 32),
+            other => panic!("shk {other:?}"),
+        }
+        let two = to_binary(&PlistValue::Dict(vec![(
+            "streams".into(),
+            PlistValue::Array(vec![
+                PlistValue::Dict(vec![
+                    ("type".into(), PlistValue::Integer(110)),
+                    ("dataPort".into(), PlistValue::Integer(6030)),
+                ]),
+                PlistValue::Dict(vec![
+                    ("type".into(), PlistValue::Integer(100)),
+                    ("dataPort".into(), PlistValue::Integer(7040)),
+                    ("controlPort".into(), PlistValue::Integer(7041)),
+                ]),
+            ]),
+        )]));
+        assert_eq!(data_port_for_type(&two, Some(110)), Some(6030));
+        assert_eq!(data_port_for_type(&two, Some(100)), Some(7040));
+    }
+
+    #[test]
+    fn control_port_from_setup_reads_stream() {
+        let body = to_binary(&PlistValue::Dict(vec![(
+            "streams".into(),
+            PlistValue::Array(vec![PlistValue::Dict(vec![
+                ("type".into(), PlistValue::Integer(96)),
+                ("dataPort".into(), PlistValue::Integer(7011)),
+                ("controlPort".into(), PlistValue::Integer(7012)),
+            ])]),
+        )]));
+        assert_eq!(data_port_from_setup(&body), Some(7011));
+        assert_eq!(control_port_from_setup(&body), Some(7012));
+        assert!(control_port_from_setup(&encode_setup_screen(99)).is_none());
     }
 }

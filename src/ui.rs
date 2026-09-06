@@ -37,6 +37,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         Screen::Files => draw_files(frame, app, chunks[0]),
         Screen::AddFolder => draw_add_folder(frame, app, chunks[0]),
         Screen::Pin => draw_pin(frame, app, chunks[0]),
+        Screen::Resume => draw_resume(frame, app, chunks[0]),
         Screen::Control => draw_control(frame, app, chunks[0]),
     }
     draw_keys(frame, app, chunks[1]);
@@ -121,11 +122,11 @@ fn draw_discovery(frame: &mut Frame, app: &App, area: Rect) {
         let empty = Paragraph::new(vec![
             Line::from(""),
             Line::from(Span::styled(
-                "No AirPlay devices found.",
+                "No receivers found.",
                 Style::default().fg(Color::Yellow),
             )),
             Line::from(""),
-            Line::from("Browsing _airplay._tcp.local.  IPv4 preferred."),
+            Line::from("Browsing AirPlay and Chromecast.  IPv4 preferred."),
         ])
         .block(inner)
         .wrap(Wrap { trim: false });
@@ -137,7 +138,7 @@ fn draw_discovery(frame: &mut Frame, app: &App, area: Rect) {
         .devices
         .iter()
         .map(|d| {
-            let label = format!("{:<24}  {}", d.name, d.addr_label());
+            let label = format!("{:<24}  {:<11}  {}", d.name, d.kind.label(), d.addr_label());
             ListItem::new(Line::from(label))
         })
         .collect();
@@ -280,6 +281,40 @@ fn draw_pin(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(body, area);
 }
 
+fn draw_resume(frame: &mut Frame, app: &App, area: Rect) {
+    let (name, pos, dur) = match &app.resume_offer {
+        Some((path, pos, dur)) => (
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+            *pos,
+            *dur,
+        ),
+        None => ("—".into(), 0.0, 0.0),
+    };
+    let at = format_time(pos);
+    let of = if dur > 0.0 {
+        format!(" / {}", format_time(dur))
+    } else {
+        String::new()
+    };
+    let body = Paragraph::new(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Continue where you left off?",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(name),
+        Line::from(format!("  {at}{of}")),
+        Line::from(""),
+        Line::from("Enter resume    n start over    Esc back"),
+    ])
+    .block(title_block("resume"))
+    .wrap(Wrap { trim: false });
+    frame.render_widget(body, area);
+}
+
 fn draw_control(frame: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -297,14 +332,22 @@ fn draw_control(frame: &mut Frame, app: &App, area: Rect) {
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "—".into());
-    let state = if app.screen_cast {
+    let state = if app.device.as_ref().is_some_and(|d| d.is_chromecast()) {
+        format!("Chromecast — picture + sound on {device}")
+    } else if app.screen_cast {
         format!("sending to the TV — on {device}")
     } else if app.playing {
         "playing".into()
     } else {
         "paused".into()
     };
-    let title = if app.screen_cast { "On TV" } else { "control" };
+    let title = if app.device.as_ref().is_some_and(|d| d.is_chromecast()) {
+        "Chromecast"
+    } else if app.screen_cast {
+        "On TV"
+    } else {
+        "control"
+    };
 
     let info = Paragraph::new(vec![
         Line::from(vec![

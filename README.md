@@ -59,6 +59,8 @@ sudo ufw allow from <TV_IP> to any port 60000:60010 proto tcp
 sudo ufw allow from <TV_IP> to any port 60000:60010 proto udp
 ```
 
+Chromecast reuses a TCP port UFW already allows (often LocalSend **53317**). No extra rule.
+
 ## Keys
 
 Every screen shows a keys panel.

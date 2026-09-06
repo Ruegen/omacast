@@ -1,7 +1,10 @@
 //! omacast — AirPlay video TUI.
 mod airplay;
 mod app;
+mod audio;
 mod bplist;
+mod cast;
+mod chromecast;
 mod config;
 mod creds;
 mod discovery;
@@ -10,6 +13,7 @@ mod fairplay;
 mod files;
 mod hap;
 mod hls;
+mod resume;
 mod http1;
 mod http_media;
 mod screen;
@@ -88,6 +92,7 @@ async fn run_play(path: PathBuf, host: String, media_port: u16) {
         Err(_) => Vec::new(),
     };
     let device = AirPlayDevice {
+        kind: crate::discovery::DeviceKind::AirPlay,
         fullname: format!("{name}._airplay._tcp.local."),
         name: name.to_string(),
         host: host.clone(),

@@ -102,8 +102,17 @@ fn lan_ipv4() -> Result<Ipv4Addr, Error> {
 struct MediaState {
     path: Arc<PathBuf>,
     hls: bool,
+    live: LiveKind,
+    start_at: f64,
     lan_ip: Ipv4Addr,
     gets: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LiveKind {
+    Off,
+    CopyVideo,
+    Transcode,
 }
 
 /// Running media server. Dropping it (or calling [`shutdown`](Self::shutdown))
@@ -113,19 +122,42 @@ pub struct MediaServer {
     pub port: u16,
     pub lan_ip: Ipv4Addr,
     ext: &'static str,
+    slug: Option<String>,
+    live: LiveKind,
     hls: Option<HlsSession>,
     gets: Arc<AtomicU64>,
 }
 
 impl MediaServer {
     pub async fn start(path: PathBuf, bind_port: u16) -> Result<Self, Error> {
-        Self::bind(path, bind_port, None).await
+        Self::bind(path, bind_port, None, None, LiveKind::Off, 0.0).await
+    }
+
+    /// Unique path so Chromecast does not keep the previous file (it keys cache on URL).
+    pub async fn start_unique(path: PathBuf, bind_port: u16, slug: String) -> Result<Self, Error> {
+        Self::bind(path, bind_port, None, Some(slug), LiveKind::Off, 0.0).await
+    }
+
+    /// ffmpeg pipe: copy H.264, downmix audio to stereo AAC (no 3GB temp file).
+    pub async fn start_live_unique(
+        path: PathBuf,
+        bind_port: u16,
+        slug: String,
+        copy_video: bool,
+        start_at: f64,
+    ) -> Result<Self, Error> {
+        let kind = if copy_video {
+            LiveKind::CopyVideo
+        } else {
+            LiveKind::Transcode
+        };
+        Self::bind(path, bind_port, None, Some(slug), kind, start_at).await
     }
 
     pub async fn start_hls(path: PathBuf, bind_port: u16) -> Result<Self, Error> {
         let session = HlsSession::start(&path).await.map_err(Error::Hls)?;
         let dir = session.dir.clone();
-        Self::bind(dir, bind_port, Some(session)).await
+        Self::bind(dir, bind_port, Some(session), None, LiveKind::Off, 0.0).await
     }
 
     pub async fn start_for(path: PathBuf, bind_port: u16, hls: bool) -> Result<Self, Error> {
@@ -136,9 +168,20 @@ impl MediaServer {
         }
     }
 
-    async fn bind(path: PathBuf, bind_port: u16, hls: Option<HlsSession>) -> Result<Self, Error> {
+    async fn bind(
+        path: PathBuf,
+        bind_port: u16,
+        hls: Option<HlsSession>,
+        slug: Option<String>,
+        live: LiveKind,
+        start_at: f64,
+    ) -> Result<Self, Error> {
         let lan_ip = lan_ipv4()?;
-        let ext = files::media_ext(&path);
+        let ext = if live != LiveKind::Off {
+            "mp4"
+        } else {
+            files::media_ext(&path)
+        };
         let listener = TcpListener::bind(("0.0.0.0", bind_port)).await?;
         let port = listener.local_addr()?.port();
         let gets = Arc::new(AtomicU64::new(0));
@@ -147,6 +190,8 @@ impl MediaServer {
         let state = MediaState {
             path: Arc::new(path),
             hls: is_hls,
+            live,
+            start_at,
             lan_ip,
             gets: gets.clone(),
         };
@@ -158,6 +203,7 @@ impl MediaServer {
                 .route("/media.mp4", get(serve_media).head(serve_media))
                 .route("/media.mkv", get(serve_media).head(serve_media))
                 .route("/media.mov", get(serve_media).head(serve_media))
+                .route("/c/{slug}", get(serve_media).head(serve_media))
                 .with_state(state)
         };
 
@@ -178,6 +224,8 @@ impl MediaServer {
             port,
             lan_ip,
             ext,
+            slug,
+            live,
             hls,
             gets,
         })
@@ -188,12 +236,19 @@ impl MediaServer {
         if let Some(hls) = &self.hls {
             format!("http://{}:{}/{}", self.lan_ip, self.port, hls.playlist)
         } else {
-            format!("http://{}:{}/media.{}", self.lan_ip, self.port, self.ext)
+            match &self.slug {
+                Some(slug) => format!("http://{}:{}/c/{}.{}", self.lan_ip, self.port, slug, self.ext),
+                None => format!("http://{}:{}/media.{}", self.lan_ip, self.port, self.ext),
+            }
         }
     }
 
     pub fn request_count(&self) -> Arc<AtomicU64> {
         self.gets.clone()
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.live != LiveKind::Off
     }
 
     pub fn origin(&self) -> String {
@@ -287,11 +342,10 @@ async fn serve_media(
     let response = serve_media_body(method.clone(), uri, headers, state.clone()).await;
     let status = response.status();
     log_media_request(&method, &path, range.as_deref(), &peer, status);
-    if (method == Method::GET || method == Method::HEAD)
+    if method == Method::GET
         && status.is_success()
-        && state.hls
-        && hls::is_hls_asset(&path)
         && is_remote_hls_peer(addr.ip(), state.lan_ip)
+        && (state.hls && hls::is_hls_asset(&path) || !state.hls)
     {
         state.gets.fetch_add(1, Ordering::Relaxed);
     }
@@ -306,6 +360,9 @@ async fn serve_media_body(
 ) -> Response {
     if method != Method::GET && method != Method::HEAD {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    if state.live != LiveKind::Off {
+        return serve_live_ffmpeg(method, &state);
     }
 
     let (file_path, content_type) = if state.hls {
@@ -324,6 +381,91 @@ async fn serve_media_body(
     };
 
     serve_file(method, headers, &file_path, content_type).await
+}
+
+fn serve_live_ffmpeg(method: Method, state: &MediaState) -> Response {
+    let builder = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "video/mp4")
+        .header(header::CACHE_CONTROL, "no-store, no-cache")
+        .header(header::CONNECTION, "close");
+    if method == Method::HEAD {
+        return builder
+            .body(Body::empty())
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+
+    let mut cmd = tokio::process::Command::new("ffmpeg");
+    cmd.arg("-hide_banner").arg("-loglevel").arg("error");
+    if state.start_at > 0.5 {
+        cmd.arg("-ss").arg(format!("{:.3}", state.start_at));
+    }
+    cmd.arg("-i").arg(state.path.as_ref());
+    match state.live {
+        LiveKind::CopyVideo => {
+            cmd.args([
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-ac", "2", "-ar", "44100",
+            ]);
+        }
+        LiveKind::Transcode => {
+            cmd.args([
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-profile:v",
+                "high",
+                "-level",
+                "4.1",
+                "-pix_fmt",
+                "yuv420p",
+                "-vf",
+                "scale=min(1920\\,iw):-2",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "160k",
+                "-ac",
+                "2",
+                "-ar",
+                "44100",
+            ]);
+        }
+        LiveKind::Off => unreachable!(),
+    }
+    cmd.args([
+        "-f",
+        "mp4",
+        "-movflags",
+        "frag_keyframe+empty_moov+default_base_moof",
+        "-flush_packets",
+        "1",
+        "pipe:1",
+    ])
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::null())
+    .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let stdout = match child.stdout.take() {
+        Some(out) => out,
+        None => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+    crate::airplay::debug_log("chromecast live ffmpeg started");
+    builder
+        .body(Body::from_stream(ReaderStream::new(stdout)))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn serve_file(
@@ -382,7 +524,7 @@ async fn serve_file(
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_LENGTH, length.to_string())
         .header(header::CONNECTION, "keep-alive")
-        .header(header::CACHE_CONTROL, "no-cache");
+        .header(header::CACHE_CONTROL, "no-store, no-cache");
 
     if status == StatusCode::PARTIAL_CONTENT {
         builder = builder.header(

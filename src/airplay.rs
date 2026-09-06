@@ -21,6 +21,7 @@ use crate::discovery::AirPlayDevice;
 use crate::event::{self, EventHub, FcupNeed, HlsOrigin};
 use crate::hap::{HapCredentials, PairSetupSession, PairVerifySession};
 use crate::http1::{Http1Client, HttpResponse};
+use crate::audio::AudioStream;
 use crate::screen::{self, PayloadCrypto, ScreenStream};
 
 #[derive(Debug, Clone)]
@@ -392,6 +393,7 @@ pub struct AirPlayClient {
     wants_hls: bool,
     media_gets: Option<Arc<AtomicU64>>,
     screen: Option<ScreenStream>,
+    audio: Option<AudioStream>,
     /// Events-Write, Events-Read HKDF pair (controller uses them swapped).
     event_keys: Option<([u8; 32], [u8; 32])>,
     incoming: Arc<AtomicU64>,
@@ -462,6 +464,7 @@ impl AirPlayClient {
             wants_hls: device_wants_hls(&device),
             media_gets: None,
             screen: None,
+            audio: None,
             event_keys: None,
             incoming: Arc::new(AtomicU64::new(0)),
             listen_task: None,
@@ -804,16 +807,21 @@ impl AirPlayClient {
 
     fn log_screen_setup_result(label: &str, resp: &HttpResponse) {
         debug_status(label, resp.status);
-        if !resp.body.is_empty() {
-            debug_log(&format!(
-                "{label} {}",
-                crate::bplist::setup_response_keys(&resp.body)
-            ));
-        }
+        debug_log(&format!(
+            "{label} body_len={} {}",
+            resp.body.len(),
+            crate::bplist::setup_response_keys(&resp.body)
+        ));
         if resp.is_success() {
             match crate::bplist::data_port_from_setup(&resp.body) {
                 Some(port) => debug_log(&format!("dataPort {port}")),
                 None => debug_log("dataPort missing"),
+            }
+            if let Some(p) = crate::bplist::data_port_for_type(&resp.body, Some(100)) {
+                debug_log(&format!("audio dataPort {p} (type 100)"));
+            }
+            if let Some(p) = crate::bplist::data_port_for_type(&resp.body, Some(110)) {
+                debug_log(&format!("video dataPort {p} (type 110)"));
             }
         }
     }
@@ -996,10 +1004,64 @@ impl AirPlayClient {
         let ekey_len = ekey.map(|k| k.len()).unwrap_or(0);
         let body = crate::bplist::encode_setup_screen_ios_fp(id, &uuid, ekey, eiv, tp, cp);
         debug_log(&format!(
-            "SETUP stream 110 ekey_len={ekey_len} timingPort={tp} controlPort={cp} (20s timeout, no audio)"
+            "SETUP stream 110 ekey_len={ekey_len} timingPort={tp} controlPort={cp} (20s timeout)"
         ));
         self.setup_stream_timeout(&body, Self::SCREEN_SETUP_TIMEOUT, "SETUP stream 110")
             .await
+    }
+
+    /// One SETUP with type 110 and type 100. Returns video setup plus audio ports.
+    async fn setup_type_110_and_100(
+        &mut self,
+        ekey: Option<&[u8]>,
+        eiv: Option<&[u8]>,
+        timing_port: u16,
+        control_port: u16,
+        shk: &[u8; 32],
+    ) -> Result<(ScreenStreamSetup, Option<(u16, Option<u16>)>), ScreenSetupTimeout> {
+        let id = Self::random_stream_connection_id();
+        self.last_stream_connection_id = Some(id);
+        let uuid = Uuid::new_v4().to_string();
+        let body = crate::bplist::encode_setup_screen_and_main_audio(
+            id,
+            &uuid,
+            ekey,
+            eiv,
+            timing_port,
+            control_port,
+            shk,
+        );
+        debug_log(&format!(
+            "SETUP stream 110+100 MainAudio timingPort={timing_port} controlPort={control_port}"
+        ));
+        match self
+            .setup_rtsp_bplist_timeout(&body, Self::SCREEN_SETUP_TIMEOUT)
+            .await
+        {
+            Ok(resp) => {
+                Self::log_screen_setup_result("SETUP stream 110+100", &resp);
+                if !resp.is_success() {
+                    return Ok((ScreenStreamSetup::Rejected, None));
+                }
+                let video = crate::bplist::data_port_for_type(&resp.body, Some(110))
+                    .or_else(|| crate::bplist::data_port_from_setup(&resp.body));
+                let audio = crate::bplist::data_port_for_type(&resp.body, Some(100));
+                let actrl = crate::bplist::control_port_from_setup(&resp.body);
+                let setup = match video {
+                    Some(p) => ScreenStreamSetup::Port(p),
+                    None => ScreenStreamSetup::OkNoPort,
+                };
+                Ok((setup, audio.map(|p| (p, actrl))))
+            }
+            Err(err) if screen::is_timeout_err(&err) => {
+                debug_log("SETUP stream 110+100 timed out");
+                Err(ScreenSetupTimeout)
+            }
+            Err(err) => {
+                debug_status_msg("SETUP stream 110+100", &err);
+                Ok((ScreenStreamSetup::Rejected, None))
+            }
+        }
     }
 
     /// Encrypted GET /stream.xml and POST /stream probes. Not play success.
@@ -1599,6 +1661,13 @@ impl AirPlayClient {
         if let Some(mut s) = self.screen.take() {
             s.stop();
         }
+        self.stop_audio_stream();
+    }
+
+    fn stop_audio_stream(&mut self) {
+        if let Some(mut s) = self.audio.take() {
+            s.stop();
+        }
     }
 
     pub fn screen_stream_active(&self) -> bool {
@@ -1693,6 +1762,82 @@ impl AirPlayClient {
         .await;
         if let Some(stream) = started {
             self.screen = Some(stream);
+        }
+    }
+
+    async fn start_audio_if_port(
+        &mut self,
+        data_port: u16,
+        control_port: Option<u16>,
+        local_file: Option<&Path>,
+        shk: [u8; 32],
+    ) {
+        let Some(file) = local_file else {
+            return;
+        };
+        self.stop_audio_stream();
+        let host = self.host.clone();
+        let started = crate::audio::start_audio_stream(
+            &host,
+            data_port,
+            control_port,
+            file,
+            &shk,
+            |line| {
+                debug_log(line);
+            },
+        )
+        .await;
+        if let Some(stream) = started {
+            self.audio = Some(stream);
+        }
+    }
+
+    /// Screen-mirror audio after type 110 (iOS/Mac capture: type 96 ALAC).
+    async fn setup_type_96_audio(
+        &mut self,
+        control_port: Option<u16>,
+    ) -> Option<(u16, Option<u16>, [u8; 32])> {
+        let body = crate::bplist::encode_setup_audio_96(control_port);
+        debug_log("SETUP stream 96 ALAC 44.1k (Mac capture, no shk)");
+        let mut shk = [0u8; 32];
+        if let Some(ikm) = self.hap_ikm {
+            let id = self.last_stream_connection_id.unwrap_or(1);
+            shk = crate::hap::data_stream_output_key(&ikm, id);
+        }
+        match self
+            .setup_rtsp_bplist_timeout(&body, Duration::from_secs(5))
+            .await
+        {
+            Ok(resp) => {
+                Self::log_screen_setup_result("SETUP stream 96", &resp);
+                if !resp.is_success() {
+                    debug_log("audio SETUP rejected; video continues");
+                    return None;
+                }
+                match crate::bplist::data_port_from_setup(&resp.body) {
+                    Some(port) => {
+                        let ctrl = crate::bplist::control_port_from_setup(&resp.body);
+                        debug_log(&format!(
+                            "audio dataPort={port} controlPort={}",
+                            ctrl.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
+                        ));
+                        Some((port, ctrl, shk))
+                    }
+                    None => {
+                        debug_log("SETUP 96 200 dataPort missing; video continues");
+                        None
+                    }
+                }
+            }
+            Err(err) if screen::is_timeout_err(&err) => {
+                debug_log("SETUP stream 96 timed out; video continues");
+                None
+            }
+            Err(err) => {
+                debug_status_msg("SETUP stream 96", &err);
+                None
+            }
         }
     }
 
@@ -2191,7 +2336,7 @@ impl AirPlayClient {
             event_port,
         );
         debug_log(&format!(
-            "SETUP session isScreenMirroringSession=true ekey_len=0 timingPort={timing_port} (HAP, no audio)"
+            "SETUP session isScreenMirroringSession=true ekey_len=0 timingPort={timing_port} (HAP)"
         ));
         match self
             .setup_rtsp_bplist_timeout(&body, Self::SCREEN_SETUP_TIMEOUT)
@@ -2293,13 +2438,14 @@ impl AirPlayClient {
         self.last_keep_alive_log = Some(now);
     }
 
-    /// HAP-encrypted screen: skip FairPlay SAP (not advertised), skip audio,
-    /// SETUP type 110, RECORD, then H264 dataPort with ChaCha from pair-verify IKM.
+    /// HAP-encrypted screen: skip FairPlay SAP (not advertised), SETUP type 110,
+    /// type 96 AAC if the TV answers, RECORD, then H264 dataPort with ChaCha
+    /// from pair-verify IKM.
     async fn play_hap_fairplay_screen(
         &mut self,
         local_file: Option<&Path>,
     ) -> Result<bool, PlayError> {
-        debug_log("HAP screen path (encrypted RTSP, FairPlay SAP skipped, no audio SETUP)");
+        debug_log("HAP screen path (encrypted RTSP, FairPlay SAP skipped)");
         if !self.http.is_encrypted() {
             debug_log("screen path skipped: control channel not HAP-encrypted");
             return Ok(false);
@@ -2339,7 +2485,6 @@ impl AirPlayClient {
                 return Ok(false);
             }
         }
-        debug_log("audio SETUP skipped");
         let plain = std::env::var("OMACAST_PLAIN").ok().as_deref() == Some("1");
         if plain {
             debug_log("OMACAST_PLAIN: SETUP 110 ekey_len=0, VCL unencrypted");
@@ -2369,8 +2514,8 @@ impl AirPlayClient {
         .await
     }
 
-    /// Play a URL. Screen TVs try HAP encrypted type 110 first (no audio).
-    /// HLS type 120 stays as fallback. `/play` 404 is not success.
+    /// Play a URL. Screen TVs use HAP type 110. HLS stays fallback if screen
+    /// does not start. `/play` 404 is not success.
     pub async fn play(
         &mut self,
         content_location: &str,
@@ -2891,6 +3036,7 @@ mod tests {
 
     fn sample_tv() -> AirPlayDevice {
         AirPlayDevice {
+            kind: crate::discovery::DeviceKind::AirPlay,
             fullname: "Lounge Room._airplay._tcp.local.".into(),
             name: "Lounge Room".into(),
             host: "192.168.178.25".into(),

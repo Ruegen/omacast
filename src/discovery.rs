@@ -1,4 +1,4 @@
-//! mDNS browse for `_airplay._tcp.local.`.
+//! mDNS browse for AirPlay and Chromecast receivers.
 
 use std::net::IpAddr;
 
@@ -8,10 +8,27 @@ use tokio::sync::mpsc;
 use crate::app::Error;
 
 const AIRPLAY_TYPE: &str = "_airplay._tcp.local.";
+const CHROMECAST_TYPE: &str = "_googlecast._tcp.local.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceKind {
+    AirPlay,
+    Chromecast,
+}
+
+impl DeviceKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AirPlay => "AirPlay",
+            Self::Chromecast => "Chromecast",
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct AirPlayDevice {
+    pub kind: DeviceKind,
     pub fullname: String,
     pub name: String,
     pub host: String,
@@ -65,6 +82,10 @@ impl AirPlayDevice {
         }
         keys
     }
+
+    pub fn is_chromecast(&self) -> bool {
+        self.kind == DeviceKind::Chromecast
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -89,29 +110,33 @@ impl Discovery {
 
         tokio::spawn(async move {
             loop {
-                let receiver = match daemon_for_task.browse(AIRPLAY_TYPE) {
+                let airplay = match daemon_for_task.browse(AIRPLAY_TYPE) {
                     Ok(receiver) => receiver,
                     Err(_) => break,
                 };
+                let chromecast = daemon_for_task.browse(CHROMECAST_TYPE).ok();
                 loop {
                     tokio::select! {
                         biased;
                         _ = refresh_rx.recv() => {
                             let _ = daemon_for_task.stop_browse(AIRPLAY_TYPE);
+                            let _ = daemon_for_task.stop_browse(CHROMECAST_TYPE);
                             let _ = events_tx.send(DiscoveryEvent::Cleared);
                             break;
                         }
-                        event = receiver.recv_async() => {
-                            match event {
-                                Ok(ServiceEvent::ServiceResolved(resolved)) => {
-                                    let device = device_from_resolved(&resolved);
-                                    let _ = events_tx.send(DiscoveryEvent::Found(device));
-                                }
-                                Ok(ServiceEvent::ServiceRemoved(_, name)) => {
-                                    let _ = events_tx.send(DiscoveryEvent::Removed(name));
-                                }
-                                Err(_) => return,
-                                _ => {}
+                        event = airplay.recv_async() => {
+                            if !forward_event(&events_tx, event) {
+                                return;
+                            }
+                        }
+                        event = async {
+                            match &chromecast {
+                                Some(rx) => rx.recv_async().await,
+                                None => std::future::pending().await,
+                            }
+                        } => {
+                            if !forward_event(&events_tx, event) {
+                                return;
                             }
                         }
                     }
@@ -143,8 +168,37 @@ fn txt(resolved: &mdns_sd::ResolvedService, key: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+fn forward_event(
+    events_tx: &mpsc::UnboundedSender<DiscoveryEvent>,
+    event: Result<ServiceEvent, mdns_sd::RecvError>,
+) -> bool {
+    match event {
+        Ok(ServiceEvent::ServiceResolved(resolved)) => {
+            let device = device_from_resolved(&resolved);
+            let _ = events_tx.send(DiscoveryEvent::Found(device));
+            true
+        }
+        Ok(ServiceEvent::ServiceRemoved(_, name)) => {
+            let _ = events_tx.send(DiscoveryEvent::Removed(name));
+            true
+        }
+        Err(_) => false,
+        _ => true,
+    }
+}
+
 fn device_from_resolved(resolved: &mdns_sd::ResolvedService) -> AirPlayDevice {
-    let name = display_name(&resolved.fullname);
+    let kind = if resolved.fullname.contains("._googlecast._tcp") {
+        DeviceKind::Chromecast
+    } else {
+        DeviceKind::AirPlay
+    };
+    let name = match kind {
+        DeviceKind::Chromecast => txt(resolved, "fn")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| display_name(&resolved.fullname)),
+        DeviceKind::AirPlay => display_name(&resolved.fullname),
+    };
     let mut addresses: Vec<IpAddr> = Vec::new();
     for scoped in &resolved.addresses {
         match scoped {
@@ -170,15 +224,22 @@ fn device_from_resolved(resolved: &mdns_sd::ResolvedService) -> AirPlayDevice {
     addresses.dedup();
 
     AirPlayDevice {
+        kind,
         fullname: resolved.fullname.clone(),
         name,
         host: resolved.host.trim_end_matches('.').to_string(),
         port: resolved.port,
         addresses,
-        deviceid: txt(resolved, "deviceid"),
+        deviceid: match kind {
+            DeviceKind::Chromecast => txt(resolved, "id").or_else(|| txt(resolved, "deviceid")),
+            DeviceKind::AirPlay => txt(resolved, "deviceid"),
+        },
         features: txt(resolved, "features").or_else(|| txt(resolved, "ft")),
         flags: txt(resolved, "flags").or_else(|| txt(resolved, "sf")),
-        model: txt(resolved, "model"),
+        model: match kind {
+            DeviceKind::Chromecast => txt(resolved, "md").or_else(|| txt(resolved, "model")),
+            DeviceKind::AirPlay => txt(resolved, "model"),
+        },
         pw: txt(resolved, "pw"),
         srcvers: txt(resolved, "srcvers"),
     }
@@ -188,6 +249,8 @@ fn display_name(fullname: &str) -> String {
     let stem = fullname
         .strip_suffix("._airplay._tcp.local.")
         .or_else(|| fullname.strip_suffix("._airplay._tcp.local"))
+        .or_else(|| fullname.strip_suffix("._googlecast._tcp.local."))
+        .or_else(|| fullname.strip_suffix("._googlecast._tcp.local"))
         .unwrap_or(fullname);
     unescape_mdns(stem)
 }

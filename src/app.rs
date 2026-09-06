@@ -34,6 +34,7 @@ pub enum Screen {
     Files,
     AddFolder,
     Pin,
+    Resume,
     Control,
 }
 
@@ -106,6 +107,10 @@ enum NetResult {
         client: Option<AirPlayClient>,
         err: String,
     },
+    CastOk {
+        session: crate::chromecast::CastSession,
+        duration: f64,
+    },
 }
 
 pub struct App {
@@ -153,6 +158,9 @@ pub struct App {
     device_id: String,
     airplay: Option<AirPlayClient>,
     media_server: Option<MediaServer>,
+    cast_session: Option<crate::chromecast::CastSession>,
+    pub resume_offer: Option<(PathBuf, f64, f64)>,
+    play_start: f64,
 }
 
 impl App {
@@ -169,7 +177,7 @@ impl App {
         let mut app = Self {
             screen: Screen::Discovery,
             should_quit: false,
-            status: "Browsing for AirPlay receivers…".to_string(),
+            status: "Browsing for AirPlay and Chromecast…".to_string(),
             devices: Vec::new(),
             selected_device: 0,
             discovery,
@@ -205,6 +213,9 @@ impl App {
             device_id,
             airplay: None,
             media_server: None,
+            cast_session: None,
+            resume_offer: None,
+            play_start: 0.0,
         };
         app.start_scan();
         Ok(app)
@@ -230,7 +241,7 @@ impl App {
                 if self.screen == Screen::Discovery {
                     let n = self.devices.len();
                     if n > 0 {
-                        self.status = format!("{n} AirPlay receiver(s)");
+                        self.status = receiver_status(n);
                     }
                 }
             }
@@ -241,7 +252,7 @@ impl App {
                     self.selected_device = self.devices.len() - 1;
                 }
                 if self.screen == Screen::Discovery && self.devices.is_empty() {
-                    self.status = "No AirPlay devices found. Press r to refresh.".to_string();
+                    self.status = "No receivers found. Press r to refresh.".to_string();
                 }
             }
             DiscoveryEvent::Cleared => {
@@ -318,6 +329,7 @@ impl App {
             Screen::Files => self.handle_files_key(key),
             Screen::AddFolder => self.handle_add_folder_key(key),
             Screen::Pin => self.handle_pin_key(key),
+            Screen::Resume => self.handle_resume_key(key),
             Screen::Control => self.handle_control_key(key).await,
         }
     }
@@ -348,7 +360,7 @@ impl App {
         }
     }
 
-    /// Pair when picking the TV, then go to Files. No media server yet.
+    /// Pair when picking an AirPlay TV, then go to Files. Chromecast skips pairing.
     fn queue_select_tv(&mut self, device: AirPlayDevice) {
         crate::airplay::clear_net_log();
         self.device = Some(device.clone());
@@ -357,6 +369,11 @@ impl App {
         self.session_paired = false;
         self.pending_location = None;
         self.last_error = None;
+        if device.is_chromecast() {
+            self.show_files();
+            self.status = format!("{} — Chromecast, pick a file", device.name);
+            return;
+        }
         let device_id = self.device_id.clone();
         let creds = self.saved_creds();
         self.spawn_net(BusyKind::Connecting, async move {
@@ -395,9 +412,9 @@ impl App {
                 self.device = None;
                 self.screen = Screen::Discovery;
                 self.status = if self.devices.is_empty() {
-                    "No AirPlay devices found. Press r to refresh.".to_string()
+                    "No receivers found. Press r to refresh.".to_string()
                 } else {
-                    format!("{} AirPlay receiver(s)", self.devices.len())
+                    receiver_status(self.devices.len())
                 };
             }
             KeyCode::Up => {
@@ -410,7 +427,7 @@ impl App {
                     self.selected_file += 1;
                 }
             }
-            KeyCode::Enter => self.queue_start_playback(),
+            KeyCode::Enter => self.offer_or_start_playback(),
             KeyCode::Char('a') => {
                 self.folder_input.clear();
                 self.screen = Screen::AddFolder;
@@ -509,9 +526,9 @@ impl App {
                     self.device = None;
                     self.screen = Screen::Discovery;
                     self.status = if self.devices.is_empty() {
-                        "No AirPlay devices found. Press r to refresh.".to_string()
+                        "No receivers found. Press r to refresh.".to_string()
                     } else {
-                        format!("{} AirPlay receiver(s)", self.devices.len())
+                        receiver_status(self.devices.len())
                     };
                 } else {
                     self.screen = Screen::Files;
@@ -543,7 +560,52 @@ impl App {
         self.teardown_server();
     }
 
-    fn queue_start_playback(&mut self) {
+    fn offer_or_start_playback(&mut self) {
+        let Some(&idx) = self.filtered.get(self.selected_file) else {
+            return;
+        };
+        let Some(file) = self.files.get(idx).cloned() else {
+            return;
+        };
+        if let Some(entry) = crate::resume::lookup(&file.path) {
+            self.resume_offer = Some((file.path, entry.position, entry.duration));
+            self.screen = Screen::Resume;
+            self.status = format!(
+                "Resume at {}?",
+                format_time(entry.position)
+            );
+            return;
+        }
+        self.queue_start_playback(0.0);
+    }
+
+    fn handle_resume_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.resume_offer = None;
+                self.screen = Screen::Files;
+                self.status_files();
+            }
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let start = self
+                    .resume_offer
+                    .as_ref()
+                    .map(|(_, p, _)| *p)
+                    .unwrap_or(0.0);
+                self.resume_offer = None;
+                self.queue_start_playback(start);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('0') | KeyCode::Home => {
+                if let Some((path, _, _)) = self.resume_offer.take() {
+                    crate::resume::clear(&path);
+                }
+                self.queue_start_playback(0.0);
+            }
+            _ => {}
+        }
+    }
+
+    fn queue_start_playback(&mut self, start: f64) {
         let Some(&idx) = self.filtered.get(self.selected_file) else {
             return;
         };
@@ -553,9 +615,11 @@ impl App {
         let Some(device) = self.device.clone() else {
             return;
         };
+        self.play_start = start.max(0.0);
         if let Some(mut server) = self.media_server.take() {
             server.shutdown();
         }
+        let prev_cast = self.cast_session.take();
         let play_ok = self.play_ok;
         self.play_ok = false;
         let client = self.airplay.take();
@@ -566,6 +630,21 @@ impl App {
         self.current_file = Some(file.path.clone());
         self.last_error = None;
         self.pending_location = None;
+        if device.is_chromecast() {
+            let start = self.play_start;
+            self.spawn_net(BusyKind::SendingToTv, async move {
+                if let Some(mut session) = prev_cast {
+                    session.stop().await;
+                }
+                job_play_chromecast(device, file, media_port, start).await
+            });
+            return;
+        }
+        if let Some(mut session) = prev_cast {
+            tokio::spawn(async move {
+                session.stop().await;
+            });
+        }
         let kind = if self
             .device
             .as_ref()
@@ -575,6 +654,7 @@ impl App {
         } else {
             BusyKind::StartingPlayback
         };
+        let start = self.play_start;
         self.spawn_net(kind, async move {
             job_play(
                 client,
@@ -585,6 +665,7 @@ impl App {
                 creds,
                 session_paired,
                 play_ok,
+                start,
             )
             .await
         });
@@ -669,7 +750,7 @@ impl App {
         match self.screen {
             Screen::Files | Screen::Pin | Screen::Control => true,
             Screen::Discovery => self.busy.is_some() || self.device.is_some(),
-            Screen::AddFolder => false,
+            Screen::AddFolder | Screen::Resume => false,
         }
     }
 
@@ -694,9 +775,9 @@ impl App {
                     self.pin_from_discovery = false;
                     self.screen = Screen::Discovery;
                     self.status = if self.devices.is_empty() {
-                        "No AirPlay devices found. Press r to refresh.".to_string()
+                        "No receivers found. Press r to refresh.".to_string()
                     } else {
-                        format!("{} AirPlay receiver(s)", self.devices.len())
+                        receiver_status(self.devices.len())
                     };
                 } else {
                     self.teardown_server();
@@ -885,6 +966,23 @@ impl App {
                 self.status = err;
                 self.stay_on_files_not_playing();
             }
+            NetResult::CastOk { session, duration } => {
+                self.cast_session = Some(session);
+                self.play_ok = true;
+                self.screen_cast = true;
+                self.last_error = None;
+                self.duration = duration;
+                self.position = 0.0;
+                let name = self
+                    .device
+                    .as_ref()
+                    .map(|d| d.name.as_str())
+                    .unwrap_or("Chromecast");
+                self.status = format!("On {name}");
+                self.goto_control_current(true);
+                self.duration = duration;
+                self.position = self.play_start;
+            }
         }
     }
 
@@ -902,6 +1000,11 @@ impl App {
         self.playing = false;
         self.play_ok = false;
         self.screen_cast = false;
+        if let Some(mut session) = self.cast_session.take() {
+            tokio::spawn(async move {
+                session.stop().await;
+            });
+        }
         self.teardown_server();
         self.pending_location = None;
         self.screen = Screen::Files;
@@ -1056,7 +1159,18 @@ impl App {
         self.last_tick = Instant::now();
     }
 
+    fn persist_resume(&self) {
+        let Some(path) = self.current_file.as_ref() else {
+            return;
+        };
+        if !self.play_ok {
+            return;
+        }
+        crate::resume::save(path, self.position, self.duration);
+    }
+
     async fn stop_and_files(&mut self) {
+        self.persist_resume();
         self.send_stop().await;
         self.teardown_server();
         self.airplay = None;
@@ -1070,6 +1184,13 @@ impl App {
     }
 
     async fn screen_cast_finished(&mut self) {
+        if let Some(path) = self.current_file.as_ref() {
+            if crate::resume::should_offer(self.position, self.duration) {
+                crate::resume::save(path, self.position, self.duration);
+            } else {
+                crate::resume::clear(path);
+            }
+        }
         self.send_stop().await;
         self.teardown_server();
         self.airplay = None;
@@ -1083,6 +1204,7 @@ impl App {
     }
 
     async fn stop_and_exit(&mut self) {
+        self.persist_resume();
         self.send_stop().await;
         self.teardown_server();
         self.should_quit = true;
@@ -1091,6 +1213,9 @@ impl App {
     async fn send_stop(&mut self) {
         if !self.play_ok {
             return;
+        }
+        if let Some(mut session) = self.cast_session.take() {
+            session.stop().await;
         }
         if let Some(client) = self.airplay.as_mut() {
             let _ = tokio::time::timeout(Duration::from_secs(2), client.stop()).await;
@@ -1105,6 +1230,7 @@ impl App {
     }
 
     pub async fn shutdown(&mut self) {
+        self.persist_resume();
         self.send_stop().await;
         self.teardown_server();
     }
@@ -1132,6 +1258,13 @@ impl App {
                 }
             }
             self.last_tick = now;
+            if let Some(session) = self.cast_session.as_ref() {
+                if session.is_finished() {
+                    self.cast_session = None;
+                    self.screen_cast_finished().await;
+                }
+                return;
+            }
             let active = if let Some(client) = self.airplay.as_mut() {
                 if client.screen_stream_active() {
                     client.keep_alive().await;
@@ -1298,6 +1431,26 @@ async fn job_submit_pin(
     }
 }
 
+fn receiver_status(n: usize) -> String {
+    format!("{n} receiver(s)")
+}
+
+async fn job_play_chromecast(
+    device: AirPlayDevice,
+    file: MediaFile,
+    media_port: u16,
+    start: f64,
+) -> NetResult {
+    let ip = device.preferred_host();
+    match crate::chromecast::start_cast(&ip, device.port, &file.path, media_port, start).await {
+        Ok((session, duration)) => NetResult::CastOk { session, duration },
+        Err(err) => NetResult::PlayFail {
+            client: None,
+            err,
+        },
+    }
+}
+
 async fn job_play(
     mut client: Option<AirPlayClient>,
     device: AirPlayDevice,
@@ -1307,6 +1460,7 @@ async fn job_play(
     creds: Option<HapCredentials>,
     _session_paired: bool,
     play_ok: bool,
+    start: f64,
 ) -> NetResult {
     if play_ok {
         if let Some(c) = client.as_mut() {
@@ -1366,7 +1520,7 @@ async fn job_play(
     // Handshake only. play() returns once a type-110 stream is rolling.
     match tokio::time::timeout(
         Duration::from_secs(75),
-        client.play(&location, 0.0, Some(file.path.as_path())),
+        client.play(&location, start, Some(file.path.as_path())),
     )
     .await
     {
@@ -1447,12 +1601,13 @@ pub fn help_text(screen: Screen) -> &'static str {
 
 pub fn help_text_cast(screen: Screen, screen_cast: bool) -> &'static str {
     match screen {
-        Screen::Discovery => "↑↓ select  Enter TV (pair)  r refresh  q quit",
+        Screen::Discovery => "↑↓ select  Enter  r refresh  q quit",
         Screen::Files => {
             "↑↓ select  type to search  Enter play  a add folder  d remove folder  Esc back"
         }
         Screen::AddFolder => "type path  Enter save  Esc cancel  ~ expands",
         Screen::Pin => "0–9 enter code  Enter confirm  Esc cancel",
+        Screen::Resume => "Enter resume  n start over  Esc back",
         Screen::Control if screen_cast => "Esc stop  q quit",
         Screen::Control => {
             "Space play/pause  ←→ 10s  Shift+←→ 1m  0–9 jump 10%  Home/End  Esc stop  q quit"
@@ -1489,11 +1644,11 @@ mod tests {
     }
 
     #[test]
-    fn discovery_help_mentions_pair_files_does_not_mention_pin() {
+    fn discovery_help_mentions_select_files_does_not_mention_pin() {
         let d = help_text(Screen::Discovery).to_ascii_lowercase();
         assert!(
-            d.contains("pair"),
-            "discovery help should mention pairing: {d}"
+            d.contains("enter"),
+            "discovery help should mention Enter: {d}"
         );
         let f = help_text(Screen::Files).to_ascii_lowercase();
         assert!(!f.contains("pin"), "files help must not mention PIN: {f}");
