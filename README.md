@@ -20,8 +20,11 @@ cp target/release/omacast ~/.local/bin/omacast
 cp packaging/Omacast.desktop ~/.local/share/applications/
 ```
 
+Optional: float on launch (no pin). Super+T tiles it into Hyprland.
+
 ```
-source = ~/apps/omacast/packaging/hyprland-omacast.conf
+-- already in ~/.config/hypr/hyprland.lua
+dofile(os.getenv("HOME") .. "/apps/omacast/packaging/hyprland-omacast.lua")
 ```
 
 Super+Space, Omacast. Pick the TV, PIN once, then choose **mirror this screen** or **play a video**. Esc stops.
@@ -36,7 +39,7 @@ No DoubleTake or omarchy-airplay dependency.
 rm -f ~/.local/bin/omacast ~/.local/share/applications/Omacast.desktop
 ```
 
-Delete `~/apps/omacast` and `~/.config/omacast` for a full wipe. In Hyprland, remove the `source` line.
+Delete `~/apps/omacast` and `~/.config/omacast` for a full wipe. In Hyprland, remove the omacast `dofile` line.
 
 ## Folders
 
