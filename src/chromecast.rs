@@ -104,7 +104,14 @@ pub async fn start_cast(
 
     let mut conn = CastConn::connect(ip, port).await?;
     if let Err(err) = conn
-        .launch_and_load(&url, "video/mp4", stream_type, start, false)
+        .launch_and_load(
+            &url,
+            "video/mp4",
+            stream_type,
+            start,
+            false,
+            crate::cast::CAST_FILE_VOLUME,
+        )
         .await
     {
         drop(server);
@@ -114,7 +121,14 @@ pub async fn start_cast(
     if !wait_for_remote_get(&server, Duration::from_secs(3)).await {
         crate::airplay::debug_log("chromecast movie GET miss, relaunch default receiver");
         if let Err(err) = conn
-            .launch_and_load(&url, "video/mp4", stream_type, start, true)
+            .launch_and_load(
+                &url,
+                "video/mp4",
+                stream_type,
+                start,
+                true,
+                crate::cast::CAST_FILE_VOLUME,
+            )
             .await
         {
             drop(server);
@@ -172,7 +186,14 @@ pub async fn start_cast_desktop(
 
     let mut conn = CastConn::connect(ip, port).await?;
     if let Err(err) = conn
-        .launch_and_load(&url, "video/mp4", "LIVE", 0.0, true)
+        .launch_and_load(
+            &url,
+            "video/mp4",
+            "LIVE",
+            0.0,
+            true,
+            crate::cast::CAST_SCREEN_VOLUME,
+        )
         .await
     {
         drop(server);

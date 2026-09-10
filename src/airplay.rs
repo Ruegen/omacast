@@ -97,12 +97,14 @@ const FEAT_HLS: u32 = 4;
 const FEAT_SCREEN: u32 = 7;
 const FEAT_AUDIO: u32 = 9;
 
-/// Hisense resets AirPlay volume to max after RECORD. 15/100, never 1.0.
+/// Hisense resets AirPlay volume to max after RECORD. Screen only, never 1.0.
 const SCREEN_VOLUME: f64 = 0.15;
+/// Movie /play. 0.15 stacked on a normal TV volume (e.g. 15) is nearly silent.
+const FILE_VOLUME: f64 = 0.85;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const KEEP_ALIVE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
-/// RTSP SET_PARAMETER / HTTP volume body. Always 0.15, never 1.0.
+/// RTSP SET_PARAMETER / HTTP volume body. Never 1.0.
 pub(crate) fn volume_parameter_body(level: f64) -> String {
     format!("volume: {level:.6}")
 }
@@ -2242,7 +2244,12 @@ impl AirPlayClient {
                     }
                 }
                 if recorded {
-                    self.set_screen_volume_after_record().await;
+                    let level = match local_file {
+                        Some(path) if crate::capture::is_desktop(path) => SCREEN_VOLUME,
+                        Some(_) => FILE_VOLUME,
+                        None => SCREEN_VOLUME,
+                    };
+                    self.set_receiver_volume(level).await;
                 } else if local_file.is_some_and(crate::capture::is_desktop) {
                     debug_log("RECORD still failing; not sending desktop frames");
                     return Ok(false);
@@ -2422,53 +2429,52 @@ impl AirPlayClient {
         }
     }
 
-    /// SET_PARAMETER volume 0.15 after RECORD. Hisense resets AirPlay volume to max.
-    /// Never send 1.0 / 100. On 400, try POST /volume then /volume?value=.
-    async fn set_screen_volume_after_record(&mut self) {
-        let body = volume_parameter_body(SCREEN_VOLUME);
-        debug_assert!(
-            (SCREEN_VOLUME - 1.0).abs() > 0.5,
-            "never send AirPlay volume 1.0"
-        );
+    /// SET_PARAMETER volume after RECORD or /play. Never send 1.0 / 100.
+    /// On 400, try POST /volume then /volume?value=.
+    async fn set_receiver_volume(&mut self, level: f64) {
+        debug_assert!(level < 1.0, "never send AirPlay volume 1.0");
+        let pct = (level * 100.0).round() as i32;
+        let body = volume_parameter_body(level);
         let extra = [("Content-Type", "text/parameters")];
         match self
             .request_rtsp("SET_PARAMETER", &extra, body.as_bytes())
             .await
         {
             Ok(resp) => {
-                debug_log(&format!("volume 0.15 (15/100) {}", resp.status));
+                debug_log(&format!("volume {level:.2} ({pct}/100) {}", resp.status));
                 if resp.is_success() {
                     return;
                 }
                 if resp.status == 400 {
-                    self.set_screen_volume_http_fallback().await;
+                    self.set_receiver_volume_http_fallback(level).await;
                 }
             }
             Err(err) => {
-                debug_status_msg("volume 0.15 (15/100)", &err);
-                self.set_screen_volume_http_fallback().await;
+                debug_status_msg(&format!("volume {level:.2} ({pct}/100)"), &err);
+                self.set_receiver_volume_http_fallback(level).await;
             }
         }
     }
 
-    async fn set_screen_volume_http_fallback(&mut self) {
-        let body = volume_parameter_body(SCREEN_VOLUME);
+    async fn set_receiver_volume_http_fallback(&mut self, level: f64) {
+        let pct = (level * 100.0).round() as i32;
+        let body = volume_parameter_body(level);
         let extra = [("Content-Type", "text/parameters")];
         match self
             .request("POST", "/volume", &extra, body.as_bytes())
             .await
         {
             Ok(resp) if resp.is_success() => {
-                debug_log(&format!("POST /volume 0.15 (15/100) {}", resp.status));
+                debug_log(&format!("POST /volume {level:.2} ({pct}/100) {}", resp.status));
                 return;
             }
-            Ok(resp) => debug_log(&format!("POST /volume 0.15 (15/100) {}", resp.status)),
-            Err(err) => debug_status_msg("POST /volume 0.15 (15/100)", &err),
+            Ok(resp) => debug_log(&format!("POST /volume {level:.2} ({pct}/100) {}", resp.status)),
+            Err(err) => debug_status_msg(&format!("POST /volume {level:.2} ({pct}/100)"), &err),
         }
-        let path = format!("/volume?value={SCREEN_VOLUME:.6}");
+        let path = format!("/volume?value={level:.6}");
         match self.request("POST", &path, &[], b"").await {
-            Ok(resp) => debug_log(&format!("POST {path} 0.15 (15/100) {}", resp.status)),
-            Err(err) => debug_status_msg(&format!("POST {path} 0.15 (15/100)"), &err),
+            Ok(resp) => debug_log(&format!("POST {path} ({pct}/100) {}", resp.status)),
+            Err(err) => debug_status_msg(&format!("POST {path} ({pct}/100)"), &err),
         }
     }
 
@@ -2633,6 +2639,7 @@ impl AirPlayClient {
             if self.wants_hls {
                 if self.play_media_hls(content_location).await? {
                     self.play_ok = true;
+                    self.set_receiver_volume(FILE_VOLUME).await;
                     return Ok(());
                 }
             } else {
@@ -2767,6 +2774,7 @@ impl AirPlayClient {
         }
         if resp.is_success() {
             self.play_ok = true;
+            self.set_receiver_volume(FILE_VOLUME).await;
             match self.post_rate(1.0).await {
                 Ok(rate_resp) => debug_status("POST /rate", rate_resp.status),
                 Err(err) => debug_status_msg("POST /rate", &err),
@@ -3095,7 +3103,7 @@ mod tests {
         fp_m2_mode, info_log_line, info_summary, is_screen_mirroring_tv, net_log_lines,
         parse_features, parse_playback_info, status_message, timing_reply, tv_features_line,
         volume_parameter_body, PlayClassify, FEAT_AUDIO, FEAT_HLS, FEAT_SCREEN, FEAT_VIDEO,
-        FP_SETUP_M1, KEEP_ALIVE_INTERVAL, KEEP_ALIVE_LOG_INTERVAL, SCREEN_VOLUME,
+        FILE_VOLUME, FP_SETUP_M1, KEEP_ALIVE_INTERVAL, KEEP_ALIVE_LOG_INTERVAL, SCREEN_VOLUME,
     };
     use crate::bplist::PlistValue;
     use crate::discovery::AirPlayDevice;
@@ -3395,12 +3403,22 @@ mod tests {
         assert!(!body.contains("1.0"), "{body}");
         assert!(!body.contains("1.000"), "{body}");
         assert!((SCREEN_VOLUME - 0.15).abs() < 1e-9);
-        assert!((SCREEN_VOLUME - 1.0).abs() > 0.5);
         assert_ne!(SCREEN_VOLUME, 1.0);
         let max = volume_parameter_body(1.0);
         assert_ne!(body, max, "screen volume must not be 1.0");
         assert_eq!(KEEP_ALIVE_INTERVAL.as_secs(), 15);
         assert_eq!(KEEP_ALIVE_LOG_INTERVAL.as_secs(), 60);
+    }
+
+    #[test]
+    fn file_volume_is_audible_and_not_max() {
+        let body = volume_parameter_body(FILE_VOLUME);
+        assert_eq!(body, "volume: 0.850000");
+        assert!(FILE_VOLUME > SCREEN_VOLUME);
+        assert!(FILE_VOLUME < 1.0);
+        assert_ne!(FILE_VOLUME, 1.0);
+        assert_ne!(body, volume_parameter_body(1.0));
+        assert_ne!(body, volume_parameter_body(SCREEN_VOLUME));
     }
 
     #[test]

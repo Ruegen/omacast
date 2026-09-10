@@ -6,7 +6,7 @@
 
 Send a local video file to an AirPlay TV or Chromecast, or mirror this screen. No local movie player.
 
-Video only for now. Omacast does not change the TV volume (it never sets 100%).
+Video only for now. Screen mirror stays at 15/100 (Hisense otherwise jumps to max). Movies use 85/100 so a normal TV volume is audible. Never 100%.
 
 ## Install (Omarchy)
 

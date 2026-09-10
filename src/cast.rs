@@ -19,8 +19,10 @@ const NS_MEDIA: &str = "urn:x-cast:com.google.cast.media";
 const DEFAULT_APP: &str = "CC1AD845";
 const SENDER: &str = "sender-0";
 const RECEIVER: &str = "receiver-0";
-/// Same as AirPlay screen volume. Never 1.0.
-const CAST_VOLUME: f64 = 0.15;
+/// Screen mirror only (same as AirPlay screen). Never 1.0.
+pub(crate) const CAST_SCREEN_VOLUME: f64 = 0.15;
+/// Movie LOAD. 0.15 on top of a normal TV volume is nearly silent.
+pub(crate) const CAST_FILE_VOLUME: f64 = 0.85;
 
 #[derive(Debug)]
 struct NoVerify;
@@ -128,6 +130,7 @@ impl CastConn {
         stream_type: &str,
         start: f64,
         force_relaunch: bool,
+        volume: f64,
     ) -> Result<(), String> {
         let id = self.next_id();
         self.send(
@@ -171,7 +174,7 @@ impl CastConn {
             .ok_or_else(|| "Chromecast launched but sent no transportId".to_string())?;
         self.send(&transport, NS_CONN, &json!({"type":"CONNECT"}))
             .await?;
-        self.set_volume(CAST_VOLUME).await?;
+        self.set_volume(volume).await?;
         let id = self.next_id();
         let load = json!({
             "type": "LOAD",
@@ -187,7 +190,7 @@ impl CastConn {
         self.send(&transport, NS_MEDIA, &load).await?;
         // LOAD is enough to start the GET. Do not block 15s for MEDIA_STATUS.
         let started = self.wait_media_started(Duration::from_secs(2)).await;
-        let _ = self.set_volume(CAST_VOLUME).await;
+        let _ = self.set_volume(volume).await;
         started
     }
 
@@ -221,10 +224,7 @@ impl CastConn {
     }
 
     async fn set_volume(&mut self, level: f64) -> Result<(), String> {
-        debug_assert!(
-            (level - 1.0).abs() > 0.5,
-            "never send Chromecast volume 1.0"
-        );
+        debug_assert!(level < 1.0, "never send Chromecast volume 1.0");
         let id = self.next_id();
         self.send(
             RECEIVER,
@@ -569,9 +569,16 @@ mod tests {
     }
 
     #[test]
-    fn cast_volume_is_fifteen_percent_not_max() {
-        assert!((CAST_VOLUME - 0.15).abs() < 1e-9);
-        assert!((CAST_VOLUME - 1.0).abs() > 0.5);
-        assert_ne!(CAST_VOLUME, 1.0);
+    fn cast_screen_volume_is_fifteen_percent_not_max() {
+        assert!((CAST_SCREEN_VOLUME - 0.15).abs() < 1e-9);
+        assert_ne!(CAST_SCREEN_VOLUME, 1.0);
+    }
+
+    #[test]
+    fn cast_file_volume_is_audible_and_not_max() {
+        assert!((CAST_FILE_VOLUME - 0.85).abs() < 1e-9);
+        assert!(CAST_FILE_VOLUME > CAST_SCREEN_VOLUME);
+        assert!(CAST_FILE_VOLUME < 1.0);
+        assert_ne!(CAST_FILE_VOLUME, 1.0);
     }
 }
